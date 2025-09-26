@@ -154,6 +154,12 @@ desktop.ini
 config.js.backup.*
 *~
 
+# Backup directories (containers may have sensitive information)
+backup/
+**/backup/
+# Allow backup README documentation
+!backup/README.md
+
 # Archive files (unless specifically needed)
 *.7z
 *.dmg
