@@ -1,0 +1,103 @@
+#!/bin/bash
+
+echo "🚀 Claude Relay Service 本地Docker部署脚本 (示例版本)"
+echo "=========================================="
+
+# 检查环境变量
+if [ -z "$REDIS_PASSWORD" ]; then
+    echo "❌ 未设置 REDIS_PASSWORD 环境变量"
+    echo "   请先设置: export REDIS_PASSWORD='your_redis_password'"
+    exit 1
+fi
+
+if [ -z "$ADMIN_PASSWORD" ]; then
+    echo "❌ 未设置 ADMIN_PASSWORD 环境变量"
+    echo "   请先设置: export ADMIN_PASSWORD='your_admin_password'"
+    exit 1
+fi
+
+# 检查Docker是否运行
+if ! docker info >/dev/null 2>&1; then
+    echo "❌ Docker未运行，请先启动Docker"
+    exit 1
+fi
+
+# 检查Redis是否可访问
+echo "🔍 检查本地Redis连接..."
+if command -v redis-cli >/dev/null 2>&1; then
+    if redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD" ping >/dev/null 2>&1; then
+        echo "✅ Redis连接正常"
+    else
+        echo "❌ Redis连接失败，请检查Redis服务和密码"
+        echo "   命令: redis-cli -h 127.0.0.1 -p 6379 -a '$REDIS_PASSWORD' ping"
+        exit 1
+    fi
+else
+    echo "⚠️  未找到redis-cli，跳过Redis连接检查"
+fi
+
+# 检查代理是否可访问
+echo "🔍 检查本地代理连接..."
+PROXY_HOST=${PROXY_HOST:-"127.0.0.1"}
+PROXY_PORT=${PROXY_PORT:-"7897"}
+
+if command -v curl >/dev/null 2>&1; then
+    if curl --proxy "http://$PROXY_HOST:$PROXY_PORT" --connect-timeout 5 https://www.google.com >/dev/null 2>&1; then
+        echo "✅ 代理连接正常"
+    else
+        echo "⚠️  代理连接测试失败，请检查代理服务 $PROXY_HOST:$PROXY_PORT"
+        echo "   继续部署，代理配置将在应用中单独设置"
+    fi
+else
+    echo "⚠️  未找到curl，跳过代理连接检查"
+fi
+
+# 创建必要目录
+echo "📁 创建必要目录..."
+mkdir -p logs data
+
+# 构建和启动服务
+echo "🏗️  构建Docker镜像..."
+docker-compose -f docker-compose.local.yml build
+
+echo "🚀 启动服务..."
+docker-compose -f docker-compose.local.yml up -d
+
+# 等待服务启动
+echo "⏳ 等待服务启动..."
+sleep 10
+
+# 检查服务状态
+echo "🔍 检查服务状态..."
+docker-compose -f docker-compose.local.yml ps
+
+# 检查健康状态
+echo "🏥 检查服务健康状态..."
+if curl -f http://localhost:3000/health >/dev/null 2>&1; then
+    echo "✅ 服务启动成功！"
+    echo ""
+    echo "🌐 访问信息："
+    echo "   管理界面: http://localhost:3000/admin-next/"
+    echo "   API端点:  http://localhost:3000/api/v1/messages"
+    echo "   健康检查: http://localhost:3000/health"
+    echo ""
+    echo "👤 管理员凭据："
+    echo "   用户名: admin"
+    echo "   密码: $ADMIN_PASSWORD"
+    echo ""
+    echo "📋 下一步操作："
+    echo "   1. 访问管理界面配置Claude账户"
+    echo "   2. 在账户设置中配置代理: $PROXY_HOST:$PROXY_PORT"
+    echo "   3. 完成OAuth授权流程"
+    echo "   4. 创建API Keys开始使用"
+else
+    echo "❌ 服务启动异常，查看日志："
+    echo "   docker-compose -f docker-compose.local.yml logs claude-relay-local"
+fi
+
+echo ""
+echo "🔧 常用命令："
+echo "   查看日志: docker-compose -f docker-compose.local.yml logs -f"
+echo "   重启服务: docker-compose -f docker-compose.local.yml restart"
+echo "   停止服务: docker-compose -f docker-compose.local.yml down"
+echo "   进入容器: docker-compose -f docker-compose.local.yml exec claude-relay-local sh"
