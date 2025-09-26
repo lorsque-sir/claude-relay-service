@@ -1,0 +1,69 @@
+version: '3.8'
+
+# Claude Relay Service - 本地部署配置示例
+# 使用本地Redis和代理服务
+# ⚠️  此文件不包含真实密码，请复制为 docker-compose.local.yml 并配置实际值
+
+services:
+  # 🚀 Claude Relay Service
+  claude-relay-local:
+    build: .
+    container_name: claude-relay-local
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    env_file:
+      - .env.local
+    environment:
+      # 🌐 服务器配置
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+
+      # 📊 Redis配置（连接到宿主机Redis）
+      # ⚠️  请在 .env.local 文件中设置 REDIS_PASSWORD
+      - REDIS_HOST=host.docker.internal
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_DB=0
+
+      # 🌐 容器级别代理配置（可选，用于容器内直接访问外网）
+      # 💡 可根据需要修改代理地址和端口
+      - HTTP_PROXY=http://host.docker.internal:7897
+      - HTTPS_PROXY=http://host.docker.internal:7897
+      - NO_PROXY=localhost,127.0.0.1,host.docker.internal
+    extra_hosts:
+      # 允许容器访问宿主机服务
+      - "host.docker.internal:host-gateway"
+    networks:
+      - claude-relay-local
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # 📈 Redis监控工具（可选）
+  redis-commander-local:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-commander-local
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      # ⚠️  请在 .env.local 文件中设置 REDIS_PASSWORD
+      - REDIS_HOSTS=local:host.docker.internal:6379:0:${REDIS_PASSWORD}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - claude-relay-local
+    profiles:
+      - monitoring
+
+networks:
+  claude-relay-local:
+    driver: bridge

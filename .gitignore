@@ -207,7 +207,9 @@ coverage/
 docs/build/
 docs/dist/
 
-# Deployment files
+# Deployment files (contain sensitive passwords)
+deploy-local.sh
+docker-compose.local.yml
 deploy/
 .deploy/
 
