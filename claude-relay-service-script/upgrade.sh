@@ -126,6 +126,7 @@ export_ports_networks_hosts() {
 build_port_args() {
     PORT_ARGS=()
     PRIMARY_HOST_PORT=""
+    declare -A port_mappings_set  # 用于去重的关联数组
     
     log_info "解析端口映射信息..."
     if [ ! -f "${PORTS_FILE}" ]; then
@@ -154,11 +155,20 @@ build_port_args() {
         log_info "解析端口映射: 容器端口=${cport}, 主机端口=${hport}"
         
         if [ -n "${cport}" ] && [ -n "${hport}" ]; then
-            PORT_ARGS+=("-p" "${hport}:${cport}")
-            if [ -z "${PRIMARY_HOST_PORT}" ]; then
-                PRIMARY_HOST_PORT="${hport}"
+            # 构建端口映射字符串用于去重
+            port_mapping="${hport}:${cport}"
+            
+            # 检查是否已存在相同的端口映射
+            if [ -z "${port_mappings_set[$port_mapping]:-}" ]; then
+                port_mappings_set[$port_mapping]=1
+                PORT_ARGS+=("-p" "$port_mapping")
+                if [ -z "${PRIMARY_HOST_PORT}" ]; then
+                    PRIMARY_HOST_PORT="${hport}"
+                fi
+                log_success "添加端口映射: -p $port_mapping"
+            else
+                log_info "跳过重复的端口映射: -p $port_mapping"
             fi
-            log_success "添加端口映射: -p ${hport}:${cport}"
         else
             log_warning "跳过无效的端口配置行: $line"
         fi
@@ -167,7 +177,7 @@ build_port_args() {
     if [ ${#PORT_ARGS[@]} -eq 0 ]; then
         log_warning "未解析到任何端口映射"
     else
-        log_success "共解析到 ${#PORT_ARGS[@]} 个端口映射"
+        log_success "共解析到 ${#PORT_ARGS[@]} 个唯一端口映射"
         log_info "主要端口: ${PRIMARY_HOST_PORT}"
     fi
 }
@@ -445,7 +455,13 @@ upgrade_container() {
 
     # 启动新容器
     log_info "启动新版本容器..."
-    docker run "${RUN_ARGS[@]}" ${IMAGE_NAME}
+    if ! docker run "${RUN_ARGS[@]}" ${IMAGE_NAME}; then
+        log_error "容器启动失败！正在清理并回滚..."
+        # 清理失败的容器
+        docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
+        rollback_container ${BACKUP_CONTAINER_NAME}
+        exit 1
+    fi
 
     # 连接剩余网络
     if [ ${#NET_ARR[@]} -gt 1 ]; then
