@@ -1,11 +1,79 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Claude Relay Service 升级脚本
 # 作者: GitHub Copilot
-# 版本: 1.1.1
+# 版本: 1.1.2
 # 创建时间: 2025-09-19
-# 修复时间: 2025-09-26
-# 修复内容: 修复端口映射丢失问题，增强错误处理和调试信息
+# 修复时间: 2025-09-29
+# 修复内容: 添加多终端兼容性支持，自动切换到bash执行
+
+# 检查当前shell并在必要时切换到bash
+check_shell_compatibility() {
+    # 检查是否在bash中运行
+    if [ -z "${BASH_VERSION:-}" ]; then
+        echo "检测到当前shell不是bash（可能是zsh/sh等）"
+        echo "正在切换到bash执行脚本..."
+        
+        # 寻找合适的bash版本，优先使用新版本
+        BASH_CMD=""
+        
+        # 检查Homebrew bash (通常是较新版本)
+        if [ -x "/opt/homebrew/bin/bash" ]; then
+            BASH_VERSION_CHECK=$(/opt/homebrew/bin/bash -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo "0")
+            if [ "$BASH_VERSION_CHECK" -ge 4 ]; then
+                BASH_CMD="/opt/homebrew/bin/bash"
+            fi
+        fi
+        
+        # 如果没找到合适的Homebrew bash，检查系统bash
+        if [ -z "$BASH_CMD" ] && command -v bash >/dev/null 2>&1; then
+            BASH_VERSION_CHECK=$(bash -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo "0")
+            if [ "$BASH_VERSION_CHECK" -ge 4 ]; then
+                BASH_CMD="bash"
+            fi
+        fi
+        
+        # 检查其他可能的bash路径
+        if [ -z "$BASH_CMD" ]; then
+            for bash_path in "/usr/local/bin/bash" "/usr/bin/bash"; do
+                if [ -x "$bash_path" ]; then
+                    BASH_VERSION_CHECK=$($bash_path -c 'echo ${BASH_VERSINFO[0]}' 2>/dev/null || echo "0")
+                    if [ "$BASH_VERSION_CHECK" -ge 4 ]; then
+                        BASH_CMD="$bash_path"
+                        break
+                    fi
+                fi
+            done
+        fi
+        
+        if [ -n "$BASH_CMD" ]; then
+            echo "使用 $BASH_CMD 执行脚本"
+            # 重新用合适的bash执行脚本，传递所有参数
+            exec "$BASH_CMD" "$0" "$@"
+        else
+            echo "错误: 未找到bash 4.0+版本"
+            echo "请安装bash 4.0+或手动使用合适的bash版本执行: bash $0"
+            echo "macOS用户可以通过以下方式安装新版bash:"
+            echo "  brew install bash"
+            exit 1
+        fi
+    fi
+    
+    # 检查bash版本是否支持关联数组（需要4.0+）
+    if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+        echo "错误: bash版本过低 (${BASH_VERSION})"
+        echo "此脚本需要bash 4.0+来支持关联数组"
+        echo "当前执行路径: $0"
+        echo "实际bash路径: $(readlink -f /proc/$$/exe 2>/dev/null || echo '未知')"
+        echo "请使用新版本bash执行脚本，例如:"
+        echo "  /opt/homebrew/bin/bash $0"
+        echo "  或安装新版bash: brew install bash"
+        exit 1
+    fi
+}
+
+# 在脚本开始时立即检查shell兼容性
+check_shell_compatibility "$@"
 
 set -euo pipefail  # 严格模式：未定义变量/管道失败均退出
 
@@ -213,10 +281,14 @@ pull_latest_image() {
     
     if [ "${CURRENT_VERSION}" = "${NEW_VERSION}" ] && [ "${IMAGE_TAG}" = "latest" ]; then
         log_warning "当前已是最新版本 ${CURRENT_VERSION}，无需升级"
-        read -p "是否强制重新部署? [y/N]: " FORCE_DEPLOY
+        echo ""  # 添加空行使输出更清晰
+        echo -n "是否强制重新部署? [y/N]: "
+        read FORCE_DEPLOY
         if [[ ! ${FORCE_DEPLOY:-n} =~ ^[Yy]$ ]]; then
+            log_info "取消升级操作"
             exit 0
         fi
+        log_info "开始强制重新部署..."
     fi
 }
 
