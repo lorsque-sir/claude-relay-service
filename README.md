@@ -396,13 +396,6 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:3000/api/" # 根据实际填写你�
 export ANTHROPIC_AUTH_TOKEN="后台创建的API密钥"
 ```
 
-如果后台添加了 Droid 类型账号池，请将基础地址改为：
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:3000/droid/claude" # 根据实际情况替换域名/IP
-export ANTHROPIC_AUTH_TOKEN="后台创建的API密钥"
-```
-
 **VSCode Claude 插件配置：**
 
 如果使用 VSCode 的 Claude 插件，需要在 `~/.claude/config.json` 文件中配置：
@@ -417,11 +410,30 @@ export ANTHROPIC_AUTH_TOKEN="后台创建的API密钥"
 
 **Gemini CLI 设置环境变量：**
 
+**方式一（推荐）：通过 Gemini Assist API 方式访问**
+
 ```bash
-export CODE_ASSIST_ENDPOINT="http://127.0.0.1:3000/gemini" # 根据实际填写你服务器的ip地址或者域名
-export GOOGLE_CLOUD_ACCESS_TOKEN="后台创建的API密钥"  # 使用相同的API密钥即可
-export GOOGLE_GENAI_USE_GCA="true"
+CODE_ASSIST_ENDPOINT="http://127.0.0.1:3000/gemini"  # 根据实际填写你服务器的ip地址或者域名
+GOOGLE_CLOUD_ACCESS_TOKEN="后台创建的API密钥"
+GOOGLE_GENAI_USE_GCA="true"
+GEMINI_MODEL="gemini-2.5-pro" # 如果你有gemini3权限可以填： gemini-3-pro-preview
 ```
+
+> **认证**：只能选 ```Login with Google``` 进行认证，如果跳 Google请删除 ```~/.gemini/settings.json``` 后再尝试启动```gemini```。  
+> **注意**：gemini-cli 控制台会提示 `Failed to fetch user info: 401 Unauthorized`，但使用不受任何影响。  
+
+**方式二：通过 Gemini API 方式访问**
+
+
+```bash
+GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:3000/gemini"  # 根据实际填写你服务器的ip地址或者域名
+GEMINI_API_KEY="后台创建的API密钥"
+GEMINI_MODEL="gemini-2.5-pro" # 如果你有gemini3权限可以填： gemini-3-pro-preview
+```
+
+> **认证**：只能选 ```Use Gemini API Key``` 进行认证，如果提示 ```Enter Gemini API Key``` 请直接留空按回车。如果一打开就跳 Google请删除 ```~/.gemini/settings.json``` 后再尝试启动```gemini```。
+
+> 💡 **进阶用法**：想在 Claude Code 中直接使用 Gemini 3 模型？请参考 [Claude Code 调用 Gemini 3 模型指南](docs/claude-code-gemini3-guide/README.md)
 
 **使用 Claude Code：**
 
@@ -441,7 +453,7 @@ gemini  # 或其他 Gemini CLI 命令
 
 ```toml
 model_provider = "crs"
-model = "gpt-5-codex"
+model = "gpt-5.1-codex-max"
 model_reasoning_effort = "high"
 disable_response_storage = true
 preferred_auth_method = "apikey"
@@ -453,8 +465,6 @@ wire_api = "responses"
 requires_openai_auth = true
 env_key = "CRS_OAI_KEY"
 ```
-
-如需通过 Droid 类型账号池访问 Codex CLI，只需将 `base_url` 改为 `http://127.0.0.1:3000/droid/openai`（其余配置保持不变）。
 
 在 `~/.codex/auth.json` 文件中配置API密钥为 null：
 
@@ -480,12 +490,12 @@ Droid CLI 读取 `~/.factory/config.json`。可以在该文件中添加自定义
 {
   "custom_models": [
     {
-      "model_display_name": "Sonnet 4.5 [crs]",
-      "model": "claude-sonnet-4-5-20250929",
+      "model_display_name": "Opus 4.5 [crs]",
+      "model": "claude-opus-4-5-20251101",
       "base_url": "http://127.0.0.1:3000/droid/claude",
       "api_key": "后台创建的API密钥",
       "provider": "anthropic",
-      "max_tokens": 8192
+      "max_tokens": 64000
     },
     {
       "model_display_name": "GPT5-Codex [crs]",
@@ -494,6 +504,22 @@ Droid CLI 读取 `~/.factory/config.json`。可以在该文件中添加自定义
       "api_key": "后台创建的API密钥",
       "provider": "openai",
       "max_tokens": 16384
+    },
+    {
+      "model_display_name": "Gemini-3-Pro [crs]",
+      "model": "gemini-3-pro-preview",
+      "base_url": "http://127.0.0.1:3000/droid/comm/v1/",
+      "api_key": "后台创建的API密钥",
+      "provider": "generic-chat-completion-api",
+      "max_tokens": 65535
+    },
+    {
+      "model_display_name": "GLM-4.6 [crs]",
+      "model": "glm-4.6",
+      "base_url": "http://127.0.0.1:3000/droid/comm/v1/",
+      "api_key": "后台创建的API密钥",
+      "provider": "generic-chat-completion-api",
+      "max_tokens": 202800
     }
   ]
 }
@@ -555,23 +581,7 @@ gpt-5                      # Codex使用固定模型ID
 - API地址填入：`http://你的服务器:3000/openai`
 - API Key填入：后台创建的API密钥（cr_开头）
 - **重要**：Codex只支持Openai-Response标准
-- 💡 如果希望在 Cherry Studio 中使用 Droid 类型账号，请改填 `http://你的服务器:3000/droid/openai`，并保持其他设置不变。
 
-**4. Droid账号接入：**
-
-```
-# Claude Code / Droid CLI 使用的 API 地址
-http://你的服务器:3000/droid/claude
-
-# Codex CLI 使用的 API 地址
-http://你的服务器:3000/droid/openai
-```
-
-配置步骤：
-- 供应商类型选择"Anthropic"或"Openai-Response"（根据模型类型）
-- API地址填入：`http://你的服务器:3000/droid/claude` 或 `http://你的服务器:3000/droid/openai`
-- API Key填入：后台创建的API密钥（cr_开头）
-- 建议自定义模型名称以区分 Droid 账号池
 
 **Cherry Studio 地址格式重要说明：**
 
@@ -587,10 +597,10 @@ http://你的服务器:3000/droid/openai
 - 所有账号类型都使用相同的API密钥（在后台统一创建）
 - 根据不同的路由前缀自动识别账号类型
 - `/claude/` - 使用Claude账号池
-- `/droid/claude/` - 使用Droid类型Claude账号池（服务于 Claude Code / Droid CLI）
+- `/droid/claude/` - 使用Droid类型Claude账号池（只建议api调用或Droid Cli中使用）
 - `/gemini/` - 使用Gemini账号池  
 - `/openai/` - 使用Codex账号（只支持Openai-Response格式）
-- `/droid/openai/` - 使用Droid类型OpenAI兼容账号池（服务于 Codex CLI）
+- `/droid/openai/` - 使用Droid类型OpenAI兼容账号池（只建议api调用或Droid Cli中使用）
 - 支持所有标准API端点（messages、models等）
 
 **重要说明：**
@@ -949,6 +959,27 @@ proxy_request_buffering off;
 - **GitHub Issues**: 提交详细的错误信息
 - **查看文档**: 仔细阅读错误信息和文档
 - **社区讨论**: 看看其他人是否遇到类似问题
+
+---
+
+## ❤️ 赞助支持
+
+如果您觉得这个项目对您有帮助，请考虑赞助支持项目的持续开发。您的支持是我们最大的动力！
+
+<div align="center">
+
+<a href="https://afdian.com/a/claude-relay-service" target="_blank">
+  <img src="https://img.shields.io/badge/请我喝杯咖啡-爱发电-946ce6?style=for-the-badge&logo=buy-me-a-coffee&logoColor=white" alt="Sponsor">
+</a>
+
+<table>
+  <tr>
+    <td><img src="docs/sponsoring/wechat.jpg" width="200" alt="wechat" /></td>
+    <td><img src="docs/sponsoring/alipay.jpg" width="200" alt="alipay" /></td>
+  </tr>
+</table>
+
+</div>
 
 ---
 

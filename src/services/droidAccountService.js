@@ -18,7 +18,7 @@ class DroidAccountService {
   constructor() {
     // WorkOS OAuth 配置
     this.oauthTokenUrl = 'https://api.workos.com/user_management/authenticate'
-    this.factoryApiBaseUrl = 'https://app.factory.ai/api/llm'
+    this.factoryApiBaseUrl = 'https://api.factory.ai/api/llm'
 
     this.workosClientId = 'client_01HNM792M5G5G1A2THWPXKFMXB'
 
@@ -45,7 +45,7 @@ class DroidAccountService {
       10 * 60 * 1000
     )
 
-    this.supportedEndpointTypes = new Set(['anthropic', 'openai'])
+    this.supportedEndpointTypes = new Set(['anthropic', 'openai', 'comm'])
   }
 
   _sanitizeEndpointType(endpointType) {
@@ -54,8 +54,12 @@ class DroidAccountService {
     }
 
     const normalized = String(endpointType).toLowerCase()
-    if (normalized === 'openai' || normalized === 'common') {
+    if (normalized === 'openai') {
       return 'openai'
+    }
+
+    if (normalized === 'comm') {
+      return 'comm'
     }
 
     if (this.supportedEndpointTypes.has(normalized)) {
@@ -183,7 +187,10 @@ class DroidAccountService {
       ? []
       : normalizedExisting
           .filter((entry) => entry && entry.id && entry.encryptedKey)
-          .map((entry) => ({ ...entry }))
+          .map((entry) => ({
+            ...entry,
+            status: entry.status || 'active' // 确保有默认状态
+          }))
 
     const hashSet = new Set(entries.map((entry) => entry.hash).filter(Boolean))
 
@@ -214,7 +221,9 @@ class DroidAccountService {
         encryptedKey: this._encryptSensitiveData(trimmed),
         createdAt: now,
         lastUsedAt: '',
-        usageCount: '0'
+        usageCount: '0',
+        status: 'active', // 新增状态字段
+        errorMessage: '' // 新增错误信息字段
       })
     }
 
@@ -230,7 +239,9 @@ class DroidAccountService {
       id: entry.id,
       createdAt: entry.createdAt || '',
       lastUsedAt: entry.lastUsedAt || '',
-      usageCount: entry.usageCount || '0'
+      usageCount: entry.usageCount || '0',
+      status: entry.status || 'active', // 新增状态字段
+      errorMessage: entry.errorMessage || '' // 新增错误信息字段
     }))
   }
 
@@ -252,7 +263,9 @@ class DroidAccountService {
       hash: entry.hash || '',
       createdAt: entry.createdAt || '',
       lastUsedAt: entry.lastUsedAt || '',
-      usageCount: Number.isFinite(usageCountNumber) && usageCountNumber >= 0 ? usageCountNumber : 0
+      usageCount: Number.isFinite(usageCountNumber) && usageCountNumber >= 0 ? usageCountNumber : 0,
+      status: entry.status || 'active', // 新增状态字段
+      errorMessage: entry.errorMessage || '' // 新增错误信息字段
     }
   }
 
@@ -309,6 +322,96 @@ class DroidAccountService {
   }
 
   /**
+   * 删除指定的 Droid API Key 条目
+   */
+  async removeApiKeyEntry(accountId, keyId) {
+    if (!accountId || !keyId) {
+      return { removed: false, remainingCount: 0 }
+    }
+
+    try {
+      const accountData = await redis.getDroidAccount(accountId)
+      if (!accountData) {
+        return { removed: false, remainingCount: 0 }
+      }
+
+      const entries = this._parseApiKeyEntries(accountData.apiKeys)
+      if (!entries || entries.length === 0) {
+        return { removed: false, remainingCount: 0 }
+      }
+
+      const filtered = entries.filter((entry) => entry && entry.id !== keyId)
+      if (filtered.length === entries.length) {
+        return { removed: false, remainingCount: entries.length }
+      }
+
+      accountData.apiKeys = filtered.length ? JSON.stringify(filtered) : ''
+      accountData.apiKeyCount = String(filtered.length)
+
+      await redis.setDroidAccount(accountId, accountData)
+
+      logger.warn(
+        `🚫 已删除 Droid API Key ${keyId}（Account: ${accountId}），剩余 ${filtered.length}`
+      )
+
+      return { removed: true, remainingCount: filtered.length }
+    } catch (error) {
+      logger.error(`❌ 删除 Droid API Key 失败：${keyId}（Account: ${accountId}）`, error)
+      return { removed: false, remainingCount: 0, error }
+    }
+  }
+
+  /**
+   * 标记指定的 Droid API Key 条目为异常状态
+   */
+  async markApiKeyAsError(accountId, keyId, errorMessage = '') {
+    if (!accountId || !keyId) {
+      return { marked: false, error: '参数无效' }
+    }
+
+    try {
+      const accountData = await redis.getDroidAccount(accountId)
+      if (!accountData) {
+        return { marked: false, error: '账户不存在' }
+      }
+
+      const entries = this._parseApiKeyEntries(accountData.apiKeys)
+      if (!entries || entries.length === 0) {
+        return { marked: false, error: '无API Key条目' }
+      }
+
+      let marked = false
+      const updatedEntries = entries.map((entry) => {
+        if (entry && entry.id === keyId) {
+          marked = true
+          return {
+            ...entry,
+            status: 'error',
+            errorMessage: errorMessage || 'API Key异常'
+          }
+        }
+        return entry
+      })
+
+      if (!marked) {
+        return { marked: false, error: '未找到指定的API Key' }
+      }
+
+      accountData.apiKeys = JSON.stringify(updatedEntries)
+      await redis.setDroidAccount(accountId, accountData)
+
+      logger.warn(
+        `⚠️ 已标记 Droid API Key ${keyId} 为异常状态（Account: ${accountId}）：${errorMessage}`
+      )
+
+      return { marked: true }
+    } catch (error) {
+      logger.error(`❌ 标记 Droid API Key 异常状态失败：${keyId}（Account: ${accountId}）`, error)
+      return { marked: false, error: error.message }
+    }
+  }
+
+  /**
    * 使用 WorkOS Refresh Token 刷新并验证凭证
    */
   async _refreshTokensWithWorkOS(refreshToken, proxyConfig = null, organizationId = null) {
@@ -339,6 +442,7 @@ class DroidAccountService {
       if (proxyAgent) {
         requestOptions.httpAgent = proxyAgent
         requestOptions.httpsAgent = proxyAgent
+        requestOptions.proxy = false
         logger.info(
           `🌐 使用代理验证 Droid Refresh Token: ${ProxyHelper.getProxyDescription(proxyConfig)}`
         )
@@ -407,6 +511,7 @@ class DroidAccountService {
       if (proxyAgent) {
         requestOptions.httpAgent = proxyAgent
         requestOptions.httpsAgent = proxyAgent
+        requestOptions.proxy = false
       }
     }
 
@@ -443,7 +548,7 @@ class DroidAccountService {
       platform = 'droid',
       priority = 50, // 调度优先级 (1-100)
       schedulable = true, // 是否可被调度
-      endpointType = 'anthropic', // 默认端点类型: 'anthropic' 或 'openai'
+      endpointType = 'anthropic', // 默认端点类型: 'anthropic', 'openai' 或 'comm'
       organizationId = '',
       ownerEmail = '',
       ownerName = '',
@@ -451,7 +556,8 @@ class DroidAccountService {
       tokenType = 'Bearer',
       authenticationMethod = '',
       expiresIn = null,
-      apiKeys = []
+      apiKeys = [],
+      userAgent = '' // 自定义 User-Agent
     } = options
 
     const accountId = uuidv4()
@@ -695,7 +801,11 @@ class DroidAccountService {
       description,
       refreshToken: this._encryptSensitiveData(normalizedRefreshToken),
       accessToken: this._encryptSensitiveData(normalizedAccessToken),
-      expiresAt: normalizedExpiresAt || '',
+      expiresAt: normalizedExpiresAt || '', // OAuth Token 过期时间（技术字段，自动刷新）
+
+      // ✅ 新增：账户订阅到期时间（业务字段，手动管理）
+      subscriptionExpiresAt: options.subscriptionExpiresAt || null,
+
       proxy: proxy ? JSON.stringify(proxy) : '',
       isActive: isActive.toString(),
       accountType,
@@ -707,7 +817,7 @@ class DroidAccountService {
       status, // created, active, expired, error
       errorMessage: '',
       schedulable: schedulable.toString(),
-      endpointType: normalizedEndpointType, // anthropic 或 openai
+      endpointType: normalizedEndpointType, // anthropic, openai 或 comm
       organizationId: normalizedOrganizationId || '',
       owner: normalizedOwnerName || normalizedOwnerEmail || '',
       ownerEmail: normalizedOwnerEmail || '',
@@ -723,7 +833,8 @@ class DroidAccountService {
           : '',
       apiKeys: hasApiKeys ? JSON.stringify(apiKeyEntries) : '',
       apiKeyCount: hasApiKeys ? String(apiKeyEntries.length) : '0',
-      apiKeyStrategy: hasApiKeys ? 'random_sticky' : ''
+      apiKeyStrategy: hasApiKeys ? 'random_sticky' : '',
+      userAgent: userAgent || '' // 自定义 User-Agent
     }
 
     await redis.setDroidAccount(accountId, accountData)
@@ -781,6 +892,11 @@ class DroidAccountService {
       accessToken: account.accessToken
         ? maskToken(this._decryptSensitiveData(account.accessToken))
         : '',
+
+      // ✅ 前端显示订阅过期时间（业务字段）
+      expiresAt: account.subscriptionExpiresAt || null,
+      platform: account.platform || 'droid',
+
       apiKeyCount: (() => {
         const parsedCount = this._parseApiKeyEntries(account.apiKeys).length
         if (account.apiKeyCount === undefined || account.apiKeyCount === null) {
@@ -815,6 +931,11 @@ class DroidAccountService {
 
     if (sanitizedUpdates.endpointType) {
       sanitizedUpdates.endpointType = this._sanitizeEndpointType(sanitizedUpdates.endpointType)
+    }
+
+    // 处理 userAgent 字段
+    if (typeof sanitizedUpdates.userAgent === 'string') {
+      sanitizedUpdates.userAgent = sanitizedUpdates.userAgent.trim()
     }
 
     const parseProxyConfig = (value) => {
@@ -921,6 +1042,12 @@ class DroidAccountService {
       }
     }
 
+    // ✅ 如果通过路由映射更新了 subscriptionExpiresAt，直接保存
+    // subscriptionExpiresAt 是业务字段，与 token 刷新独立
+    if (sanitizedUpdates.subscriptionExpiresAt !== undefined) {
+      // 直接保存，不做任何调整
+    }
+
     if (sanitizedUpdates.proxy === undefined) {
       sanitizedUpdates.proxy = account.proxy || ''
     }
@@ -932,7 +1059,26 @@ class DroidAccountService {
         : ''
     )
     const newApiKeysInput = Array.isArray(updates.apiKeys) ? updates.apiKeys : []
+    const removeApiKeysInput = Array.isArray(updates.removeApiKeys) ? updates.removeApiKeys : []
     const wantsClearApiKeys = Boolean(updates.clearApiKeys)
+    const rawApiKeyMode =
+      typeof updates.apiKeyUpdateMode === 'string'
+        ? updates.apiKeyUpdateMode.trim().toLowerCase()
+        : ''
+
+    let apiKeyUpdateMode = ['append', 'replace', 'delete', 'update'].includes(rawApiKeyMode)
+      ? rawApiKeyMode
+      : ''
+
+    if (!apiKeyUpdateMode) {
+      if (wantsClearApiKeys) {
+        apiKeyUpdateMode = 'replace'
+      } else if (removeApiKeysInput.length > 0) {
+        apiKeyUpdateMode = 'delete'
+      } else {
+        apiKeyUpdateMode = 'append'
+      }
+    }
 
     if (sanitizedUpdates.apiKeys !== undefined) {
       delete sanitizedUpdates.apiKeys
@@ -940,33 +1086,152 @@ class DroidAccountService {
     if (sanitizedUpdates.clearApiKeys !== undefined) {
       delete sanitizedUpdates.clearApiKeys
     }
+    if (sanitizedUpdates.apiKeyUpdateMode !== undefined) {
+      delete sanitizedUpdates.apiKeyUpdateMode
+    }
+    if (sanitizedUpdates.removeApiKeys !== undefined) {
+      delete sanitizedUpdates.removeApiKeys
+    }
 
-    if (wantsClearApiKeys || newApiKeysInput.length > 0) {
-      const mergedApiKeys = this._buildApiKeyEntries(
+    let mergedApiKeys = existingApiKeyEntries
+    let apiKeysUpdated = false
+    let addedCount = 0
+    let removedCount = 0
+
+    if (apiKeyUpdateMode === 'delete') {
+      const removalHashes = new Set()
+
+      for (const candidate of removeApiKeysInput) {
+        if (typeof candidate !== 'string') {
+          continue
+        }
+        const trimmed = candidate.trim()
+        if (!trimmed) {
+          continue
+        }
+        const hash = crypto.createHash('sha256').update(trimmed).digest('hex')
+        removalHashes.add(hash)
+      }
+
+      if (removalHashes.size > 0) {
+        mergedApiKeys = existingApiKeyEntries.filter(
+          (entry) => entry && entry.hash && !removalHashes.has(entry.hash)
+        )
+        removedCount = existingApiKeyEntries.length - mergedApiKeys.length
+        apiKeysUpdated = removedCount > 0
+
+        if (!apiKeysUpdated) {
+          logger.warn(
+            `⚠️ 删除模式未匹配任何 Droid API Key: ${accountId} (提供 ${removalHashes.size} 条)`
+          )
+        }
+      } else if (removeApiKeysInput.length > 0) {
+        logger.warn(`⚠️ 删除模式未收到有效的 Droid API Key: ${accountId}`)
+      }
+    } else if (apiKeyUpdateMode === 'update') {
+      // 更新模式：根据提供的 key 匹配现有条目并更新状态
+      mergedApiKeys = [...existingApiKeyEntries]
+      const updatedHashes = new Set()
+
+      for (const updateItem of newApiKeysInput) {
+        if (!updateItem || typeof updateItem !== 'object') {
+          continue
+        }
+
+        const key = updateItem.key || updateItem.apiKey || ''
+        if (!key || typeof key !== 'string') {
+          continue
+        }
+
+        const trimmed = key.trim()
+        if (!trimmed) {
+          continue
+        }
+
+        const hash = crypto.createHash('sha256').update(trimmed).digest('hex')
+        updatedHashes.add(hash)
+
+        // 查找现有条目
+        const existingIndex = mergedApiKeys.findIndex((entry) => entry && entry.hash === hash)
+
+        if (existingIndex !== -1) {
+          // 更新现有条目的状态信息
+          const existingEntry = mergedApiKeys[existingIndex]
+          mergedApiKeys[existingIndex] = {
+            ...existingEntry,
+            status: updateItem.status || existingEntry.status || 'active',
+            errorMessage:
+              updateItem.errorMessage !== undefined
+                ? updateItem.errorMessage
+                : existingEntry.errorMessage || '',
+            lastUsedAt:
+              updateItem.lastUsedAt !== undefined
+                ? updateItem.lastUsedAt
+                : existingEntry.lastUsedAt || '',
+            usageCount:
+              updateItem.usageCount !== undefined
+                ? String(updateItem.usageCount)
+                : existingEntry.usageCount || '0'
+          }
+          apiKeysUpdated = true
+        }
+      }
+
+      if (!apiKeysUpdated) {
+        logger.warn(
+          `⚠️ 更新模式未匹配任何 Droid API Key: ${accountId} (提供 ${updatedHashes.size} 个哈希)`
+        )
+      }
+    } else {
+      const clearExisting = apiKeyUpdateMode === 'replace' || wantsClearApiKeys
+      const baselineCount = clearExisting ? 0 : existingApiKeyEntries.length
+
+      mergedApiKeys = this._buildApiKeyEntries(
         newApiKeysInput,
         existingApiKeyEntries,
-        wantsClearApiKeys
+        clearExisting
       )
 
-      const baselineCount = wantsClearApiKeys ? 0 : existingApiKeyEntries.length
-      const addedCount = Math.max(mergedApiKeys.length - baselineCount, 0)
+      addedCount = Math.max(mergedApiKeys.length - baselineCount, 0)
+      apiKeysUpdated = clearExisting || addedCount > 0
+    }
 
+    if (apiKeysUpdated) {
       sanitizedUpdates.apiKeys = mergedApiKeys.length ? JSON.stringify(mergedApiKeys) : ''
       sanitizedUpdates.apiKeyCount = String(mergedApiKeys.length)
+
+      if (apiKeyUpdateMode === 'delete') {
+        logger.info(
+          `🔑 删除模式更新 Droid API keys for ${accountId}: 已移除 ${removedCount} 条，剩余 ${mergedApiKeys.length}`
+        )
+      } else if (apiKeyUpdateMode === 'update') {
+        logger.info(
+          `🔑 更新模式更新 Droid API keys for ${accountId}: 更新了 ${newApiKeysInput.length} 个 API Key 的状态信息`
+        )
+      } else if (apiKeyUpdateMode === 'replace' || wantsClearApiKeys) {
+        logger.info(
+          `🔑 覆盖模式更新 Droid API keys for ${accountId}: 当前总数 ${mergedApiKeys.length}，新增 ${addedCount}`
+        )
+      } else {
+        logger.info(
+          `🔑 追加模式更新 Droid API keys for ${accountId}: 当前总数 ${mergedApiKeys.length}，新增 ${addedCount}`
+        )
+      }
 
       if (mergedApiKeys.length > 0) {
         sanitizedUpdates.authenticationMethod = 'api_key'
         sanitizedUpdates.status = sanitizedUpdates.status || 'active'
-        logger.info(
-          `🔑 Updated Droid API keys for ${accountId}: total ${mergedApiKeys.length} (added ${addedCount})`
-        )
-      } else {
-        logger.info(`🔑 Cleared all API keys for Droid account ${accountId}`)
-        // 如果完全移除 API Key，可根据是否仍有 token 来确定认证方式
-        if (!sanitizedUpdates.accessToken && !account.accessToken) {
-          sanitizedUpdates.authenticationMethod =
-            account.authenticationMethod === 'api_key' ? '' : account.authenticationMethod
-        }
+      } else if (!sanitizedUpdates.accessToken && !account.accessToken) {
+        const shouldPreserveApiKeyMode =
+          account.authenticationMethod &&
+          account.authenticationMethod.toLowerCase().trim() === 'api_key' &&
+          (apiKeyUpdateMode === 'replace' || apiKeyUpdateMode === 'delete')
+
+        sanitizedUpdates.authenticationMethod = shouldPreserveApiKeyMode
+          ? 'api_key'
+          : account.authenticationMethod === 'api_key'
+            ? ''
+            : account.authenticationMethod
       }
     }
 
@@ -1138,6 +1403,19 @@ class DroidAccountService {
   }
 
   /**
+   * 检查账户订阅是否过期
+   * @param {Object} account - 账户对象
+   * @returns {boolean} - true: 已过期, false: 未过期
+   */
+  isSubscriptionExpired(account) {
+    if (!account.subscriptionExpiresAt) {
+      return false // 未设置视为永不过期
+    }
+    const expiryDate = new Date(account.subscriptionExpiresAt)
+    return expiryDate <= new Date()
+  }
+
+  /**
    * 获取有效的 access token（自动刷新）
    */
   async getValidAccessToken(accountId) {
@@ -1182,6 +1460,14 @@ class DroidAccountService {
         const isSchedulable = this._isTruthy(account.schedulable)
         const status = typeof account.status === 'string' ? account.status.toLowerCase() : ''
 
+        // ✅ 检查账户订阅是否过期
+        if (this.isSubscriptionExpired(account)) {
+          logger.debug(
+            `⏰ Skipping expired Droid account: ${account.name}, expired at ${account.subscriptionExpiresAt}`
+          )
+          return false
+        }
+
         if (!isActive || !isSchedulable || status !== 'active') {
           return false
         }
@@ -1198,6 +1484,11 @@ class DroidAccountService {
 
         if (normalizedFilter === 'anthropic') {
           return accountEndpoint === 'anthropic' || accountEndpoint === 'openai'
+        }
+
+        // comm 端点可以使用任何类型的账户
+        if (normalizedFilter === 'comm') {
+          return true
         }
 
         return accountEndpoint === normalizedFilter
@@ -1265,7 +1556,8 @@ class DroidAccountService {
     const normalizedType = this._sanitizeEndpointType(endpointType)
     const baseUrls = {
       anthropic: `${this.factoryApiBaseUrl}/a${endpoint}`,
-      openai: `${this.factoryApiBaseUrl}/o${endpoint}`
+      openai: `${this.factoryApiBaseUrl}/o${endpoint}`,
+      comm: `${this.factoryApiBaseUrl}/o${endpoint}`
     }
 
     return baseUrls[normalizedType] || baseUrls.openai

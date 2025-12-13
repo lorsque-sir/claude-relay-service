@@ -9,11 +9,10 @@ const crypto = require('crypto')
 
 // 生成会话哈希
 function generateSessionHash(req) {
-  const sessionData = [
-    req.headers['user-agent'],
-    req.ip,
-    req.headers['authorization']?.substring(0, 20)
-  ]
+  const authSource =
+    req.headers['authorization'] || req.headers['x-api-key'] || req.headers['x-goog-api-key']
+
+  const sessionData = [req.headers['user-agent'], req.ip, authSource?.substring(0, 20)]
     .filter(Boolean)
     .join(':')
 
@@ -387,7 +386,7 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
         candidatesTokenCount: 0,
         totalTokenCount: 0
       }
-      const usageReported = false
+      let usageReported = false // 修复：改为 let 以便后续修改
 
       streamResponse.on('data', (chunk) => {
         try {
@@ -513,6 +512,9 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
             logger.info(
               `📊 Recorded Gemini stream usage - Input: ${totalUsage.promptTokenCount}, Output: ${totalUsage.candidatesTokenCount}, Total: ${totalUsage.totalTokenCount}`
             )
+
+            // 修复：标记 usage 已上报，避免重复上报
+            usageReported = true
           } catch (error) {
             logger.error('Failed to record Gemini usage:', error)
           }
@@ -535,8 +537,23 @@ router.post('/v1/chat/completions', authenticateApiKey, async (req, res) => {
           })
         } else {
           // 如果已经开始发送流数据，发送错误事件
-          res.write(`data: {"error": {"message": "${error.message || 'Stream error'}"}}\n\n`)
-          res.write('data: [DONE]\n\n')
+          // 修复：使用 JSON.stringify 避免字符串插值导致的格式错误
+          if (!res.destroyed) {
+            try {
+              res.write(
+                `data: ${JSON.stringify({
+                  error: {
+                    message: error.message || 'Stream error',
+                    type: 'stream_error',
+                    code: error.code
+                  }
+                })}\n\n`
+              )
+              res.write('data: [DONE]\n\n')
+            } catch (writeError) {
+              logger.error('Error sending error event:', writeError)
+            }
+          }
           res.end()
         }
       })

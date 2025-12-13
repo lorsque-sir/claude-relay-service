@@ -73,6 +73,30 @@ const config = {
   proxy: {
     timeout: parseInt(process.env.DEFAULT_PROXY_TIMEOUT) || 600000, // 10分钟
     maxRetries: parseInt(process.env.MAX_PROXY_RETRIES) || 3,
+    // 连接池与 Keep-Alive 配置（默认关闭，需要显式开启）
+    keepAlive: (() => {
+      if (process.env.PROXY_KEEP_ALIVE === undefined || process.env.PROXY_KEEP_ALIVE === '') {
+        return false
+      }
+      return process.env.PROXY_KEEP_ALIVE === 'true'
+    })(),
+    maxSockets: (() => {
+      if (process.env.PROXY_MAX_SOCKETS === undefined || process.env.PROXY_MAX_SOCKETS === '') {
+        return undefined
+      }
+      const parsed = parseInt(process.env.PROXY_MAX_SOCKETS)
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined
+    })(),
+    maxFreeSockets: (() => {
+      if (
+        process.env.PROXY_MAX_FREE_SOCKETS === undefined ||
+        process.env.PROXY_MAX_FREE_SOCKETS === ''
+      ) {
+        return undefined
+      }
+      const parsed = parseInt(process.env.PROXY_MAX_FREE_SOCKETS)
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
+    })(),
     // IP协议族配置：true=IPv4, false=IPv6, 默认IPv4（兼容性更好）
     useIPv4: process.env.PROXY_USE_IPV4 !== 'false' // 默认 true，只有明确设置为 'false' 才使用 IPv6
   },
@@ -179,6 +203,15 @@ const config = {
   development: {
     debug: process.env.DEBUG === 'true',
     hotReload: process.env.HOT_RELOAD === 'true'
+  },
+
+  // 📬 用户消息队列配置
+  // 优化说明：锁在请求发送成功后立即释放（而非请求完成后），因为 Claude API 限流基于请求发送时刻计算
+  userMessageQueue: {
+    enabled: process.env.USER_MESSAGE_QUEUE_ENABLED === 'true', // 默认关闭
+    delayMs: parseInt(process.env.USER_MESSAGE_QUEUE_DELAY_MS) || 200, // 请求间隔（毫秒）
+    timeoutMs: parseInt(process.env.USER_MESSAGE_QUEUE_TIMEOUT_MS) || 5000, // 队列等待超时（毫秒），锁持有时间短，无需长等待
+    lockTtlMs: parseInt(process.env.USER_MESSAGE_QUEUE_LOCK_TTL_MS) || 5000 // 锁TTL（毫秒），5秒足以覆盖请求发送
   }
 }
 

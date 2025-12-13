@@ -5,8 +5,6 @@
 
 const express = require('express')
 const router = express.Router()
-const fs = require('fs')
-const path = require('path')
 const logger = require('../utils/logger')
 const { authenticateApiKey } = require('../middleware/auth')
 const claudeRelayService = require('../services/claudeRelayService')
@@ -16,17 +14,8 @@ const unifiedClaudeScheduler = require('../services/unifiedClaudeScheduler')
 const claudeCodeHeadersService = require('../services/claudeCodeHeadersService')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
-
-// 加载模型定价数据
-let modelPricingData = {}
-try {
-  const pricingPath = path.join(__dirname, '../../data/model_pricing.json')
-  const pricingContent = fs.readFileSync(pricingPath, 'utf8')
-  modelPricingData = JSON.parse(pricingContent)
-  logger.info('✅ Model pricing data loaded successfully')
-} catch (error) {
-  logger.error('❌ Failed to load model pricing data:', error)
-}
+const pricingService = require('../services/pricingService')
+const { getEffectiveModel } = require('../utils/modelHelper')
 
 // 🔧 辅助函数：检查 API Key 权限
 function checkPermissions(apiKeyData, requiredPermission = 'claude') {
@@ -87,9 +76,9 @@ router.get('/v1/models', authenticateApiKey, async (req, res) => {
       }
     ]
 
-    // 如果启用了模型限制，过滤模型列表
+    // 如果启用了模型限制，视为黑名单：过滤掉受限模型
     if (apiKeyData.enableModelRestriction && apiKeyData.restrictedModels?.length > 0) {
-      models = models.filter((model) => apiKeyData.restrictedModels.includes(model.id))
+      models = models.filter((model) => !apiKeyData.restrictedModels.includes(model.id))
     }
 
     res.json({
@@ -126,9 +115,9 @@ router.get('/v1/models/:model', authenticateApiKey, async (req, res) => {
       })
     }
 
-    // 检查模型限制
+    // 模型限制（黑名单）：命中则直接拒绝
     if (apiKeyData.enableModelRestriction && apiKeyData.restrictedModels?.length > 0) {
-      if (!apiKeyData.restrictedModels.includes(modelId)) {
+      if (apiKeyData.restrictedModels.includes(modelId)) {
         return res.status(404).json({
           error: {
             message: `Model '${modelId}' not found`,
@@ -140,7 +129,7 @@ router.get('/v1/models/:model', authenticateApiKey, async (req, res) => {
     }
 
     // 从 model_pricing.json 获取模型信息
-    const modelData = modelPricingData[modelId]
+    const modelData = pricingService.getModelPricing(modelId)
 
     // 构建标准 OpenAI 格式的模型响应
     let modelInfo
@@ -211,9 +200,10 @@ async function handleChatCompletion(req, res, apiKeyData) {
     // 转换 OpenAI 请求为 Claude 格式
     const claudeRequest = openaiToClaude.convertRequest(req.body)
 
-    // 检查模型限制
+    // 模型限制（黑名单）：命中受限模型则拒绝
     if (apiKeyData.enableModelRestriction && apiKeyData.restrictedModels?.length > 0) {
-      if (!apiKeyData.restrictedModels.includes(claudeRequest.model)) {
+      const effectiveModel = getEffectiveModel(claudeRequest.model || '')
+      if (apiKeyData.restrictedModels.includes(effectiveModel)) {
         return res.status(403).json({
           error: {
             message: `Model ${req.body.model} is not allowed for this API key`,
@@ -490,3 +480,4 @@ router.post('/v1/completions', authenticateApiKey, async (req, res) => {
 })
 
 module.exports = router
+module.exports.handleChatCompletion = handleChatCompletion

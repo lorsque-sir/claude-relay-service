@@ -50,6 +50,18 @@ function getWeekStringInTimezone(date = new Date()) {
   return `${year}-W${String(weekNumber).padStart(2, '0')}`
 }
 
+// 并发队列相关常量
+const QUEUE_STATS_TTL_SECONDS = 86400 * 7 // 统计计数保留 7 天
+const WAIT_TIME_TTL_SECONDS = 86400 // 等待时间样本保留 1 天（滚动窗口，无需长期保留）
+// 等待时间样本数配置（提高统计置信度）
+// - 每 API Key 从 100 提高到 500：提供更稳定的 P99 估计
+// - 全局从 500 提高到 2000：支持更高精度的 P99.9 分析
+// - 内存开销约 12-20KB（Redis quicklist 每元素 1-10 字节），可接受
+// 详见 design.md Decision 5: 等待时间统计样本数
+const WAIT_TIME_SAMPLES_PER_KEY = 500 // 每个 API Key 保留的等待时间样本数
+const WAIT_TIME_SAMPLES_GLOBAL = 2000 // 全局保留的等待时间样本数
+const QUEUE_TTL_BUFFER_SECONDS = 30 // 排队计数器TTL缓冲时间
+
 class RedisClient {
   constructor() {
     this.client = null
@@ -164,6 +176,243 @@ class RedisClient {
       }
     }
     return apiKeys
+  }
+
+  /**
+   * 使用 SCAN 获取所有 API Key ID（避免 KEYS 命令阻塞）
+   * @returns {Promise<string[]>} API Key ID 列表
+   */
+  async scanApiKeyIds() {
+    const keyIds = []
+    let cursor = '0'
+
+    do {
+      const [newCursor, keys] = await this.client.scan(cursor, 'MATCH', 'apikey:*', 'COUNT', 100)
+      cursor = newCursor
+
+      for (const key of keys) {
+        if (key !== 'apikey:hash_map') {
+          keyIds.push(key.replace('apikey:', ''))
+        }
+      }
+    } while (cursor !== '0')
+
+    return keyIds
+  }
+
+  /**
+   * 批量获取 API Key 数据（使用 Pipeline 优化）
+   * @param {string[]} keyIds - API Key ID 列表
+   * @returns {Promise<Object[]>} API Key 数据列表
+   */
+  async batchGetApiKeys(keyIds) {
+    if (!keyIds || keyIds.length === 0) {
+      return []
+    }
+
+    const pipeline = this.client.pipeline()
+    for (const keyId of keyIds) {
+      pipeline.hgetall(`apikey:${keyId}`)
+    }
+
+    const results = await pipeline.exec()
+    const apiKeys = []
+
+    for (let i = 0; i < results.length; i++) {
+      const [err, data] = results[i]
+      if (!err && data && Object.keys(data).length > 0) {
+        apiKeys.push({ id: keyIds[i], ...this._parseApiKeyData(data) })
+      }
+    }
+
+    return apiKeys
+  }
+
+  /**
+   * 解析 API Key 数据，将字符串转换为正确的类型
+   * @param {Object} data - 原始数据
+   * @returns {Object} 解析后的数据
+   */
+  _parseApiKeyData(data) {
+    if (!data) {
+      return data
+    }
+
+    const parsed = { ...data }
+
+    // 布尔字段
+    const boolFields = ['isActive', 'enableModelRestriction', 'isDeleted']
+    for (const field of boolFields) {
+      if (parsed[field] !== undefined) {
+        parsed[field] = parsed[field] === 'true'
+      }
+    }
+
+    // 数字字段
+    const numFields = [
+      'tokenLimit',
+      'dailyCostLimit',
+      'totalCostLimit',
+      'rateLimitRequests',
+      'rateLimitTokens',
+      'rateLimitWindow',
+      'rateLimitCost',
+      'maxConcurrency',
+      'activationDuration'
+    ]
+    for (const field of numFields) {
+      if (parsed[field] !== undefined && parsed[field] !== '') {
+        parsed[field] = parseFloat(parsed[field]) || 0
+      }
+    }
+
+    // 数组字段（JSON 解析）
+    const arrayFields = ['tags', 'restrictedModels', 'allowedClients']
+    for (const field of arrayFields) {
+      if (parsed[field]) {
+        try {
+          parsed[field] = JSON.parse(parsed[field])
+        } catch (e) {
+          parsed[field] = []
+        }
+      }
+    }
+
+    return parsed
+  }
+
+  /**
+   * 获取 API Keys 分页数据（不含费用，用于优化列表加载）
+   * @param {Object} options - 分页和筛选选项
+   * @returns {Promise<{items: Object[], pagination: Object, availableTags: string[]}>}
+   */
+  async getApiKeysPaginated(options = {}) {
+    const {
+      page = 1,
+      pageSize = 20,
+      searchMode = 'apiKey',
+      search = '',
+      tag = '',
+      isActive = '',
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      excludeDeleted = true, // 默认排除已删除的 API Keys
+      modelFilter = []
+    } = options
+
+    // 1. 使用 SCAN 获取所有 apikey:* 的 ID 列表（避免阻塞）
+    const keyIds = await this.scanApiKeyIds()
+
+    // 2. 使用 Pipeline 批量获取基础数据
+    const apiKeys = await this.batchGetApiKeys(keyIds)
+
+    // 3. 应用筛选条件
+    let filteredKeys = apiKeys
+
+    // 排除已删除的 API Keys（默认行为）
+    if (excludeDeleted) {
+      filteredKeys = filteredKeys.filter((k) => !k.isDeleted)
+    }
+
+    // 状态筛选
+    if (isActive !== '' && isActive !== undefined && isActive !== null) {
+      const activeValue = isActive === 'true' || isActive === true
+      filteredKeys = filteredKeys.filter((k) => k.isActive === activeValue)
+    }
+
+    // 标签筛选
+    if (tag) {
+      filteredKeys = filteredKeys.filter((k) => {
+        const tags = Array.isArray(k.tags) ? k.tags : []
+        return tags.includes(tag)
+      })
+    }
+
+    // 搜索
+    if (search) {
+      const lowerSearch = search.toLowerCase().trim()
+      if (searchMode === 'apiKey') {
+        // apiKey 模式：搜索名称和拥有者
+        filteredKeys = filteredKeys.filter(
+          (k) =>
+            (k.name && k.name.toLowerCase().includes(lowerSearch)) ||
+            (k.ownerDisplayName && k.ownerDisplayName.toLowerCase().includes(lowerSearch))
+        )
+      } else if (searchMode === 'bindingAccount') {
+        // bindingAccount 模式：直接在Redis层处理，避免路由层加载10000条
+        const accountNameCacheService = require('../services/accountNameCacheService')
+        filteredKeys = accountNameCacheService.searchByBindingAccount(filteredKeys, lowerSearch)
+      }
+    }
+
+    // 模型筛选
+    if (modelFilter.length > 0) {
+      const keyIdsWithModels = await this.getKeyIdsWithModels(
+        filteredKeys.map((k) => k.id),
+        modelFilter
+      )
+      filteredKeys = filteredKeys.filter((k) => keyIdsWithModels.has(k.id))
+    }
+
+    // 4. 排序
+    filteredKeys.sort((a, b) => {
+      // status 排序实际上使用 isActive 字段（API Key 没有 status 字段）
+      const effectiveSortBy = sortBy === 'status' ? 'isActive' : sortBy
+      let aVal = a[effectiveSortBy]
+      let bVal = b[effectiveSortBy]
+
+      // 日期字段转时间戳
+      if (['createdAt', 'expiresAt', 'lastUsedAt'].includes(effectiveSortBy)) {
+        aVal = aVal ? new Date(aVal).getTime() : 0
+        bVal = bVal ? new Date(bVal).getTime() : 0
+      }
+
+      // 布尔字段转数字
+      if (effectiveSortBy === 'isActive') {
+        aVal = aVal ? 1 : 0
+        bVal = bVal ? 1 : 0
+      }
+
+      // 字符串字段
+      if (sortBy === 'name') {
+        aVal = (aVal || '').toLowerCase()
+        bVal = (bVal || '').toLowerCase()
+      }
+
+      if (aVal < bVal) {
+        return sortOrder === 'asc' ? -1 : 1
+      }
+      if (aVal > bVal) {
+        return sortOrder === 'asc' ? 1 : -1
+      }
+      return 0
+    })
+
+    // 5. 收集所有可用标签（在分页之前）
+    const allTags = new Set()
+    for (const key of apiKeys) {
+      const tags = Array.isArray(key.tags) ? key.tags : []
+      tags.forEach((t) => allTags.add(t))
+    }
+    const availableTags = [...allTags].sort()
+
+    // 6. 分页
+    const total = filteredKeys.length
+    const totalPages = Math.ceil(total / pageSize) || 1
+    const validPage = Math.min(Math.max(1, page), totalPages)
+    const start = (validPage - 1) * pageSize
+    const items = filteredKeys.slice(start, start + pageSize)
+
+    return {
+      items,
+      pagination: {
+        page: validPage,
+        pageSize,
+        total,
+        totalPages
+      },
+      availableTags
+    }
   }
 
   // 🔍 通过哈希值查找API Key（性能优化）
@@ -554,6 +803,58 @@ class RedisClient {
     await Promise.all(operations)
   }
 
+  /**
+   * 获取使用了指定模型的 Key IDs（OR 逻辑）
+   */
+  async getKeyIdsWithModels(keyIds, models) {
+    if (!keyIds.length || !models.length) {
+      return new Set()
+    }
+
+    const client = this.getClientSafe()
+    const result = new Set()
+
+    // 批量检查每个 keyId 是否使用过任意一个指定模型
+    for (const keyId of keyIds) {
+      for (const model of models) {
+        // 检查是否有该模型的使用记录（daily 或 monthly）
+        const pattern = `usage:${keyId}:model:*:${model}:*`
+        const keys = await client.keys(pattern)
+        if (keys.length > 0) {
+          result.add(keyId)
+          break // 找到一个就够了（OR 逻辑）
+        }
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * 获取所有被使用过的模型列表
+   */
+  async getAllUsedModels() {
+    const client = this.getClientSafe()
+    const models = new Set()
+
+    // 扫描所有模型使用记录
+    const pattern = 'usage:*:model:daily:*'
+    let cursor = '0'
+    do {
+      const [nextCursor, keys] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 1000)
+      cursor = nextCursor
+      for (const key of keys) {
+        // 从 key 中提取模型名: usage:{keyId}:model:daily:{model}:{date}
+        const match = key.match(/usage:[^:]+:model:daily:([^:]+):/)
+        if (match) {
+          models.add(match[1])
+        }
+      }
+    } while (cursor !== '0')
+
+    return [...models].sort()
+  }
+
   async getUsageStats(keyId) {
     const totalKey = `usage:${keyId}`
     const today = getDateStringInTimezone()
@@ -714,7 +1015,7 @@ class RedisClient {
     const dailyKey = `usage:cost:daily:${keyId}:${today}`
     const monthlyKey = `usage:cost:monthly:${keyId}:${currentMonth}`
     const hourlyKey = `usage:cost:hourly:${keyId}:${currentHour}`
-    const totalKey = `usage:cost:total:${keyId}`
+    const totalKey = `usage:cost:total:${keyId}` // 总费用键 - 永不过期，持续累加
 
     logger.debug(
       `💰 Incrementing cost for ${keyId}, amount: $${amount}, date: ${today}, dailyKey: ${dailyKey}`
@@ -724,8 +1025,8 @@ class RedisClient {
       this.client.incrbyfloat(dailyKey, amount),
       this.client.incrbyfloat(monthlyKey, amount),
       this.client.incrbyfloat(hourlyKey, amount),
-      this.client.incrbyfloat(totalKey, amount),
-      // 设置过期时间
+      this.client.incrbyfloat(totalKey, amount), // ✅ 累加到总费用（永不过期）
+      // 设置过期时间（注意：totalKey 不设置过期时间，保持永久累计）
       this.client.expire(dailyKey, 86400 * 30), // 30天
       this.client.expire(monthlyKey, 86400 * 90), // 90天
       this.client.expire(hourlyKey, 86400 * 7) // 7天
@@ -1575,12 +1876,52 @@ class RedisClient {
   // 获取并发配置
   _getConcurrencyConfig() {
     const defaults = {
-      leaseSeconds: 900,
+      leaseSeconds: 300,
+      renewIntervalSeconds: 30,
       cleanupGraceSeconds: 30
     }
-    return {
+
+    const configValues = {
       ...defaults,
       ...(config.concurrency || {})
+    }
+
+    const normalizeNumber = (value, fallback, options = {}) => {
+      const parsed = Number(value)
+      if (!Number.isFinite(parsed)) {
+        return fallback
+      }
+
+      if (options.allowZero && parsed === 0) {
+        return 0
+      }
+
+      if (options.min !== undefined && parsed < options.min) {
+        return options.min
+      }
+
+      return parsed
+    }
+
+    return {
+      leaseSeconds: normalizeNumber(configValues.leaseSeconds, defaults.leaseSeconds, {
+        min: 30
+      }),
+      renewIntervalSeconds: normalizeNumber(
+        configValues.renewIntervalSeconds,
+        defaults.renewIntervalSeconds,
+        {
+          allowZero: true,
+          min: 0
+        }
+      ),
+      cleanupGraceSeconds: normalizeNumber(
+        configValues.cleanupGraceSeconds,
+        defaults.cleanupGraceSeconds,
+        {
+          min: 0
+        }
+      )
     }
   }
 
@@ -1650,9 +1991,9 @@ class RedisClient {
         local now = tonumber(ARGV[3])
         local ttl = tonumber(ARGV[4])
 
-        local exists = redis.call('ZSCORE', key, member)
-
         redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+
+        local exists = redis.call('ZSCORE', key, member)
 
         if exists then
           redis.call('ZADD', key, expireAt, member)
@@ -1732,6 +2073,278 @@ class RedisClient {
     } catch (error) {
       logger.error('❌ Failed to get concurrency:', error)
       return 0
+    }
+  }
+
+  // 🏢 Claude Console 账户并发控制（复用现有并发机制）
+  // 增加 Console 账户并发计数
+  async incrConsoleAccountConcurrency(accountId, requestId, leaseSeconds = null) {
+    if (!requestId) {
+      throw new Error('Request ID is required for console account concurrency tracking')
+    }
+    // 使用特殊的 key 前缀区分 Console 账户并发
+    const compositeKey = `console_account:${accountId}`
+    return await this.incrConcurrency(compositeKey, requestId, leaseSeconds)
+  }
+
+  // 刷新 Console 账户并发租约
+  async refreshConsoleAccountConcurrencyLease(accountId, requestId, leaseSeconds = null) {
+    if (!requestId) {
+      return 0
+    }
+    const compositeKey = `console_account:${accountId}`
+    return await this.refreshConcurrencyLease(compositeKey, requestId, leaseSeconds)
+  }
+
+  // 减少 Console 账户并发计数
+  async decrConsoleAccountConcurrency(accountId, requestId) {
+    const compositeKey = `console_account:${accountId}`
+    return await this.decrConcurrency(compositeKey, requestId)
+  }
+
+  // 获取 Console 账户当前并发数
+  async getConsoleAccountConcurrency(accountId) {
+    const compositeKey = `console_account:${accountId}`
+    return await this.getConcurrency(compositeKey)
+  }
+
+  // 🔧 并发管理方法（用于管理员手动清理）
+
+  /**
+   * 获取所有并发状态
+   * @returns {Promise<Array>} 并发状态列表
+   */
+  async getAllConcurrencyStatus() {
+    try {
+      const client = this.getClientSafe()
+      const keys = await client.keys('concurrency:*')
+      const now = Date.now()
+      const results = []
+
+      for (const key of keys) {
+        // 提取 apiKeyId（去掉 concurrency: 前缀）
+        const apiKeyId = key.replace('concurrency:', '')
+
+        // 获取所有成员和分数（过期时间）
+        const members = await client.zrangebyscore(key, now, '+inf', 'WITHSCORES')
+
+        // 解析成员和过期时间
+        const activeRequests = []
+        for (let i = 0; i < members.length; i += 2) {
+          const requestId = members[i]
+          const expireAt = parseInt(members[i + 1])
+          const remainingSeconds = Math.max(0, Math.round((expireAt - now) / 1000))
+          activeRequests.push({
+            requestId,
+            expireAt: new Date(expireAt).toISOString(),
+            remainingSeconds
+          })
+        }
+
+        // 获取过期的成员数量
+        const expiredCount = await client.zcount(key, '-inf', now)
+
+        results.push({
+          apiKeyId,
+          key,
+          activeCount: activeRequests.length,
+          expiredCount,
+          activeRequests
+        })
+      }
+
+      return results
+    } catch (error) {
+      logger.error('❌ Failed to get all concurrency status:', error)
+      throw error
+    }
+  }
+
+  /**
+   * 获取特定 API Key 的并发状态详情
+   * @param {string} apiKeyId - API Key ID
+   * @returns {Promise<Object>} 并发状态详情
+   */
+  async getConcurrencyStatus(apiKeyId) {
+    try {
+      const client = this.getClientSafe()
+      const key = `concurrency:${apiKeyId}`
+      const now = Date.now()
+
+      // 检查 key 是否存在
+      const exists = await client.exists(key)
+      if (!exists) {
+        return {
+          apiKeyId,
+          key,
+          activeCount: 0,
+          expiredCount: 0,
+          activeRequests: [],
+          exists: false
+        }
+      }
+
+      // 获取所有成员和分数
+      const allMembers = await client.zrange(key, 0, -1, 'WITHSCORES')
+
+      const activeRequests = []
+      const expiredRequests = []
+
+      for (let i = 0; i < allMembers.length; i += 2) {
+        const requestId = allMembers[i]
+        const expireAt = parseInt(allMembers[i + 1])
+        const remainingSeconds = Math.round((expireAt - now) / 1000)
+
+        const requestInfo = {
+          requestId,
+          expireAt: new Date(expireAt).toISOString(),
+          remainingSeconds
+        }
+
+        if (expireAt > now) {
+          activeRequests.push(requestInfo)
+        } else {
+          expiredRequests.push(requestInfo)
+        }
+      }
+
+      return {
+        apiKeyId,
+        key,
+        activeCount: activeRequests.length,
+        expiredCount: expiredRequests.length,
+        activeRequests,
+        expiredRequests,
+        exists: true
+      }
+    } catch (error) {
+      logger.error(`❌ Failed to get concurrency status for ${apiKeyId}:`, error)
+      throw error
+    }
+  }
+
+  /**
+   * 强制清理特定 API Key 的并发计数（忽略租约）
+   * @param {string} apiKeyId - API Key ID
+   * @returns {Promise<Object>} 清理结果
+   */
+  async forceClearConcurrency(apiKeyId) {
+    try {
+      const client = this.getClientSafe()
+      const key = `concurrency:${apiKeyId}`
+
+      // 获取清理前的状态
+      const beforeCount = await client.zcard(key)
+
+      // 删除整个 key
+      await client.del(key)
+
+      logger.warn(
+        `🧹 Force cleared concurrency for key ${apiKeyId}, removed ${beforeCount} entries`
+      )
+
+      return {
+        apiKeyId,
+        key,
+        clearedCount: beforeCount,
+        success: true
+      }
+    } catch (error) {
+      logger.error(`❌ Failed to force clear concurrency for ${apiKeyId}:`, error)
+      throw error
+    }
+  }
+
+  /**
+   * 强制清理所有并发计数
+   * @returns {Promise<Object>} 清理结果
+   */
+  async forceClearAllConcurrency() {
+    try {
+      const client = this.getClientSafe()
+      const keys = await client.keys('concurrency:*')
+
+      let totalCleared = 0
+      const clearedKeys = []
+
+      for (const key of keys) {
+        const count = await client.zcard(key)
+        await client.del(key)
+        totalCleared += count
+        clearedKeys.push({
+          key,
+          clearedCount: count
+        })
+      }
+
+      logger.warn(
+        `🧹 Force cleared all concurrency: ${keys.length} keys, ${totalCleared} total entries`
+      )
+
+      return {
+        keysCleared: keys.length,
+        totalEntriesCleared: totalCleared,
+        clearedKeys,
+        success: true
+      }
+    } catch (error) {
+      logger.error('❌ Failed to force clear all concurrency:', error)
+      throw error
+    }
+  }
+
+  /**
+   * 清理过期的并发条目（不影响活跃请求）
+   * @param {string} apiKeyId - API Key ID（可选，不传则清理所有）
+   * @returns {Promise<Object>} 清理结果
+   */
+  async cleanupExpiredConcurrency(apiKeyId = null) {
+    try {
+      const client = this.getClientSafe()
+      const now = Date.now()
+      let keys
+
+      if (apiKeyId) {
+        keys = [`concurrency:${apiKeyId}`]
+      } else {
+        keys = await client.keys('concurrency:*')
+      }
+
+      let totalCleaned = 0
+      const cleanedKeys = []
+
+      for (const key of keys) {
+        // 只清理过期的条目
+        const cleaned = await client.zremrangebyscore(key, '-inf', now)
+        if (cleaned > 0) {
+          totalCleaned += cleaned
+          cleanedKeys.push({
+            key,
+            cleanedCount: cleaned
+          })
+        }
+
+        // 如果 key 为空，删除它
+        const remaining = await client.zcard(key)
+        if (remaining === 0) {
+          await client.del(key)
+        }
+      }
+
+      logger.info(
+        `🧹 Cleaned up expired concurrency: ${totalCleaned} entries from ${cleanedKeys.length} keys`
+      )
+
+      return {
+        keysProcessed: keys.length,
+        keysCleaned: cleanedKeys.length,
+        totalEntriesCleaned: totalCleaned,
+        cleanedKeys,
+        success: true
+      }
+    } catch (error) {
+      logger.error('❌ Failed to cleanup expired concurrency:', error)
+      throw error
     }
   }
 
@@ -1954,5 +2567,594 @@ redisClient.getDateInTimezone = getDateInTimezone
 redisClient.getDateStringInTimezone = getDateStringInTimezone
 redisClient.getHourInTimezone = getHourInTimezone
 redisClient.getWeekStringInTimezone = getWeekStringInTimezone
+
+// ============== 用户消息队列相关方法 ==============
+
+/**
+ * 尝试获取用户消息队列锁
+ * 使用 Lua 脚本保证原子性
+ * @param {string} accountId - 账户ID
+ * @param {string} requestId - 请求ID
+ * @param {number} lockTtlMs - 锁 TTL（毫秒）
+ * @param {number} delayMs - 请求间隔（毫秒）
+ * @returns {Promise<{acquired: boolean, waitMs: number}>}
+ *   - acquired: 是否成功获取锁
+ *   - waitMs: 需要等待的毫秒数（-1表示被占用需等待，>=0表示需要延迟的毫秒数）
+ */
+redisClient.acquireUserMessageLock = async function (accountId, requestId, lockTtlMs, delayMs) {
+  const lockKey = `user_msg_queue_lock:${accountId}`
+  const lastTimeKey = `user_msg_queue_last:${accountId}`
+
+  const script = `
+    local lockKey = KEYS[1]
+    local lastTimeKey = KEYS[2]
+    local requestId = ARGV[1]
+    local lockTtl = tonumber(ARGV[2])
+    local delayMs = tonumber(ARGV[3])
+
+    -- 检查锁是否空闲
+    local currentLock = redis.call('GET', lockKey)
+    if currentLock == false then
+      -- 检查是否需要延迟
+      local lastTime = redis.call('GET', lastTimeKey)
+      local now = redis.call('TIME')
+      local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+
+      if lastTime then
+        local elapsed = nowMs - tonumber(lastTime)
+        if elapsed < delayMs then
+          -- 需要等待的毫秒数
+          return {0, delayMs - elapsed}
+        end
+      end
+
+      -- 获取锁
+      redis.call('SET', lockKey, requestId, 'PX', lockTtl)
+      return {1, 0}
+    end
+
+    -- 锁被占用，返回等待
+    return {0, -1}
+  `
+
+  try {
+    const result = await this.client.eval(
+      script,
+      2,
+      lockKey,
+      lastTimeKey,
+      requestId,
+      lockTtlMs,
+      delayMs
+    )
+    return {
+      acquired: result[0] === 1,
+      waitMs: result[1]
+    }
+  } catch (error) {
+    logger.error(`Failed to acquire user message lock for account ${accountId}:`, error)
+    // 返回 redisError 标记，让上层能区分 Redis 故障和正常锁占用
+    return { acquired: false, waitMs: -1, redisError: true, errorMessage: error.message }
+  }
+}
+
+/**
+ * 释放用户消息队列锁并记录完成时间
+ * @param {string} accountId - 账户ID
+ * @param {string} requestId - 请求ID
+ * @returns {Promise<boolean>} 是否成功释放
+ */
+redisClient.releaseUserMessageLock = async function (accountId, requestId) {
+  const lockKey = `user_msg_queue_lock:${accountId}`
+  const lastTimeKey = `user_msg_queue_last:${accountId}`
+
+  const script = `
+    local lockKey = KEYS[1]
+    local lastTimeKey = KEYS[2]
+    local requestId = ARGV[1]
+
+    -- 验证锁持有者
+    local currentLock = redis.call('GET', lockKey)
+    if currentLock == requestId then
+      -- 记录完成时间
+      local now = redis.call('TIME')
+      local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+      redis.call('SET', lastTimeKey, nowMs, 'EX', 60)  -- 60秒后过期
+
+      -- 删除锁
+      redis.call('DEL', lockKey)
+      return 1
+    end
+    return 0
+  `
+
+  try {
+    const result = await this.client.eval(script, 2, lockKey, lastTimeKey, requestId)
+    return result === 1
+  } catch (error) {
+    logger.error(`Failed to release user message lock for account ${accountId}:`, error)
+    return false
+  }
+}
+
+/**
+ * 强制释放用户消息队列锁（用于清理孤儿锁）
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<boolean>} 是否成功释放
+ */
+redisClient.forceReleaseUserMessageLock = async function (accountId) {
+  const lockKey = `user_msg_queue_lock:${accountId}`
+
+  try {
+    await this.client.del(lockKey)
+    return true
+  } catch (error) {
+    logger.error(`Failed to force release user message lock for account ${accountId}:`, error)
+    return false
+  }
+}
+
+/**
+ * 获取用户消息队列统计信息（用于调试）
+ * @param {string} accountId - 账户ID
+ * @returns {Promise<Object>} 队列统计
+ */
+redisClient.getUserMessageQueueStats = async function (accountId) {
+  const lockKey = `user_msg_queue_lock:${accountId}`
+  const lastTimeKey = `user_msg_queue_last:${accountId}`
+
+  try {
+    const [lockHolder, lastTime, lockTtl] = await Promise.all([
+      this.client.get(lockKey),
+      this.client.get(lastTimeKey),
+      this.client.pttl(lockKey)
+    ])
+
+    return {
+      accountId,
+      isLocked: !!lockHolder,
+      lockHolder,
+      lockTtlMs: lockTtl > 0 ? lockTtl : 0,
+      lockTtlRaw: lockTtl, // 原始 PTTL 值：>0 有TTL，-1 无过期时间，-2 键不存在
+      lastCompletedAt: lastTime ? new Date(parseInt(lastTime)).toISOString() : null
+    }
+  } catch (error) {
+    logger.error(`Failed to get user message queue stats for account ${accountId}:`, error)
+    return {
+      accountId,
+      isLocked: false,
+      lockHolder: null,
+      lockTtlMs: 0,
+      lockTtlRaw: -2,
+      lastCompletedAt: null
+    }
+  }
+}
+
+/**
+ * 扫描所有用户消息队列锁（用于清理任务）
+ * @returns {Promise<string[]>} 账户ID列表
+ */
+redisClient.scanUserMessageQueueLocks = async function () {
+  const accountIds = []
+  let cursor = '0'
+  let iterations = 0
+  const MAX_ITERATIONS = 1000 // 防止无限循环
+
+  try {
+    do {
+      const [newCursor, keys] = await this.client.scan(
+        cursor,
+        'MATCH',
+        'user_msg_queue_lock:*',
+        'COUNT',
+        100
+      )
+      cursor = newCursor
+      iterations++
+
+      for (const key of keys) {
+        const accountId = key.replace('user_msg_queue_lock:', '')
+        accountIds.push(accountId)
+      }
+
+      // 防止无限循环
+      if (iterations >= MAX_ITERATIONS) {
+        logger.warn(
+          `📬 User message queue: SCAN reached max iterations (${MAX_ITERATIONS}), stopping early`,
+          { foundLocks: accountIds.length }
+        )
+        break
+      }
+    } while (cursor !== '0')
+
+    if (accountIds.length > 0) {
+      logger.debug(
+        `📬 User message queue: scanned ${accountIds.length} lock(s) in ${iterations} iteration(s)`
+      )
+    }
+
+    return accountIds
+  } catch (error) {
+    logger.error('Failed to scan user message queue locks:', error)
+    return []
+  }
+}
+
+// ============================================
+// 🚦 API Key 并发请求排队方法
+// ============================================
+
+/**
+ * 增加排队计数（使用 Lua 脚本确保原子性）
+ * @param {string} apiKeyId - API Key ID
+ * @param {number} [timeoutMs=60000] - 排队超时时间（毫秒），用于计算 TTL
+ * @returns {Promise<number>} 增加后的排队数量
+ */
+redisClient.incrConcurrencyQueue = async function (apiKeyId, timeoutMs = 60000) {
+  const key = `concurrency:queue:${apiKeyId}`
+  try {
+    // 使用 Lua 脚本确保 INCR 和 EXPIRE 原子执行，防止进程崩溃导致计数器泄漏
+    // TTL = 超时时间 + 缓冲时间（确保键不会在请求还在等待时过期）
+    const ttlSeconds = Math.ceil(timeoutMs / 1000) + QUEUE_TTL_BUFFER_SECONDS
+    const script = `
+      local count = redis.call('INCR', KEYS[1])
+      redis.call('EXPIRE', KEYS[1], ARGV[1])
+      return count
+    `
+    const count = await this.client.eval(script, 1, key, String(ttlSeconds))
+    logger.database(
+      `🚦 Incremented queue count for key ${apiKeyId}: ${count} (TTL: ${ttlSeconds}s)`
+    )
+    return parseInt(count)
+  } catch (error) {
+    logger.error(`Failed to increment concurrency queue for ${apiKeyId}:`, error)
+    throw error
+  }
+}
+
+/**
+ * 减少排队计数（使用 Lua 脚本确保原子性）
+ * @param {string} apiKeyId - API Key ID
+ * @returns {Promise<number>} 减少后的排队数量
+ */
+redisClient.decrConcurrencyQueue = async function (apiKeyId) {
+  const key = `concurrency:queue:${apiKeyId}`
+  try {
+    // 使用 Lua 脚本确保 DECR 和 DEL 原子执行，防止进程崩溃导致计数器残留
+    const script = `
+      local count = redis.call('DECR', KEYS[1])
+      if count <= 0 then
+        redis.call('DEL', KEYS[1])
+        return 0
+      end
+      return count
+    `
+    const count = await this.client.eval(script, 1, key)
+    const result = parseInt(count)
+    if (result === 0) {
+      logger.database(`🚦 Queue count for key ${apiKeyId} is 0, removed key`)
+    } else {
+      logger.database(`🚦 Decremented queue count for key ${apiKeyId}: ${result}`)
+    }
+    return result
+  } catch (error) {
+    logger.error(`Failed to decrement concurrency queue for ${apiKeyId}:`, error)
+    throw error
+  }
+}
+
+/**
+ * 获取排队计数
+ * @param {string} apiKeyId - API Key ID
+ * @returns {Promise<number>} 当前排队数量
+ */
+redisClient.getConcurrencyQueueCount = async function (apiKeyId) {
+  const key = `concurrency:queue:${apiKeyId}`
+  try {
+    const count = await this.client.get(key)
+    return parseInt(count || 0)
+  } catch (error) {
+    logger.error(`Failed to get concurrency queue count for ${apiKeyId}:`, error)
+    return 0
+  }
+}
+
+/**
+ * 清空排队计数
+ * @param {string} apiKeyId - API Key ID
+ * @returns {Promise<boolean>} 是否成功清空
+ */
+redisClient.clearConcurrencyQueue = async function (apiKeyId) {
+  const key = `concurrency:queue:${apiKeyId}`
+  try {
+    await this.client.del(key)
+    logger.database(`🚦 Cleared queue count for key ${apiKeyId}`)
+    return true
+  } catch (error) {
+    logger.error(`Failed to clear concurrency queue for ${apiKeyId}:`, error)
+    return false
+  }
+}
+
+/**
+ * 扫描所有排队计数器
+ * @returns {Promise<string[]>} API Key ID 列表
+ */
+redisClient.scanConcurrencyQueueKeys = async function () {
+  const apiKeyIds = []
+  let cursor = '0'
+  let iterations = 0
+  const MAX_ITERATIONS = 1000
+
+  try {
+    do {
+      const [newCursor, keys] = await this.client.scan(
+        cursor,
+        'MATCH',
+        'concurrency:queue:*',
+        'COUNT',
+        100
+      )
+      cursor = newCursor
+      iterations++
+
+      for (const key of keys) {
+        // 排除统计和等待时间相关的键
+        if (
+          key.startsWith('concurrency:queue:stats:') ||
+          key.startsWith('concurrency:queue:wait_times:')
+        ) {
+          continue
+        }
+        const apiKeyId = key.replace('concurrency:queue:', '')
+        apiKeyIds.push(apiKeyId)
+      }
+
+      if (iterations >= MAX_ITERATIONS) {
+        logger.warn(
+          `🚦 Concurrency queue: SCAN reached max iterations (${MAX_ITERATIONS}), stopping early`,
+          { foundQueues: apiKeyIds.length }
+        )
+        break
+      }
+    } while (cursor !== '0')
+
+    return apiKeyIds
+  } catch (error) {
+    logger.error('Failed to scan concurrency queue keys:', error)
+    return []
+  }
+}
+
+/**
+ * 清理所有排队计数器（用于服务重启）
+ * @returns {Promise<number>} 清理的计数器数量
+ */
+redisClient.clearAllConcurrencyQueues = async function () {
+  let cleared = 0
+  let cursor = '0'
+  let iterations = 0
+  const MAX_ITERATIONS = 1000
+
+  try {
+    do {
+      const [newCursor, keys] = await this.client.scan(
+        cursor,
+        'MATCH',
+        'concurrency:queue:*',
+        'COUNT',
+        100
+      )
+      cursor = newCursor
+      iterations++
+
+      // 只删除排队计数器，保留统计数据
+      const queueKeys = keys.filter(
+        (key) =>
+          !key.startsWith('concurrency:queue:stats:') &&
+          !key.startsWith('concurrency:queue:wait_times:')
+      )
+
+      if (queueKeys.length > 0) {
+        await this.client.del(...queueKeys)
+        cleared += queueKeys.length
+      }
+
+      if (iterations >= MAX_ITERATIONS) {
+        break
+      }
+    } while (cursor !== '0')
+
+    if (cleared > 0) {
+      logger.info(`🚦 Cleared ${cleared} concurrency queue counter(s) on startup`)
+    }
+    return cleared
+  } catch (error) {
+    logger.error('Failed to clear all concurrency queues:', error)
+    return 0
+  }
+}
+
+/**
+ * 增加排队统计计数（使用 Lua 脚本确保原子性）
+ * @param {string} apiKeyId - API Key ID
+ * @param {string} field - 统计字段 (entered/success/timeout/cancelled)
+ * @returns {Promise<number>} 增加后的计数
+ */
+redisClient.incrConcurrencyQueueStats = async function (apiKeyId, field) {
+  const key = `concurrency:queue:stats:${apiKeyId}`
+  try {
+    // 使用 Lua 脚本确保 HINCRBY 和 EXPIRE 原子执行
+    // 防止在两者之间崩溃导致统计键没有 TTL（内存泄漏）
+    const script = `
+      local count = redis.call('HINCRBY', KEYS[1], ARGV[1], 1)
+      redis.call('EXPIRE', KEYS[1], ARGV[2])
+      return count
+    `
+    const count = await this.client.eval(script, 1, key, field, String(QUEUE_STATS_TTL_SECONDS))
+    return parseInt(count)
+  } catch (error) {
+    logger.error(`Failed to increment queue stats ${field} for ${apiKeyId}:`, error)
+    return 0
+  }
+}
+
+/**
+ * 获取排队统计
+ * @param {string} apiKeyId - API Key ID
+ * @returns {Promise<Object>} 统计数据
+ */
+redisClient.getConcurrencyQueueStats = async function (apiKeyId) {
+  const key = `concurrency:queue:stats:${apiKeyId}`
+  try {
+    const stats = await this.client.hgetall(key)
+    return {
+      entered: parseInt(stats?.entered || 0),
+      success: parseInt(stats?.success || 0),
+      timeout: parseInt(stats?.timeout || 0),
+      cancelled: parseInt(stats?.cancelled || 0),
+      socket_changed: parseInt(stats?.socket_changed || 0),
+      rejected_overload: parseInt(stats?.rejected_overload || 0)
+    }
+  } catch (error) {
+    logger.error(`Failed to get queue stats for ${apiKeyId}:`, error)
+    return {
+      entered: 0,
+      success: 0,
+      timeout: 0,
+      cancelled: 0,
+      socket_changed: 0,
+      rejected_overload: 0
+    }
+  }
+}
+
+/**
+ * 记录排队等待时间（按 API Key 分开存储）
+ * @param {string} apiKeyId - API Key ID
+ * @param {number} waitTimeMs - 等待时间（毫秒）
+ * @returns {Promise<void>}
+ */
+redisClient.recordQueueWaitTime = async function (apiKeyId, waitTimeMs) {
+  const key = `concurrency:queue:wait_times:${apiKeyId}`
+  try {
+    // 使用 Lua 脚本确保原子性，同时设置 TTL 防止内存泄漏
+    const script = `
+      redis.call('LPUSH', KEYS[1], ARGV[1])
+      redis.call('LTRIM', KEYS[1], 0, ARGV[2])
+      redis.call('EXPIRE', KEYS[1], ARGV[3])
+      return 1
+    `
+    await this.client.eval(
+      script,
+      1,
+      key,
+      waitTimeMs,
+      WAIT_TIME_SAMPLES_PER_KEY - 1,
+      WAIT_TIME_TTL_SECONDS
+    )
+  } catch (error) {
+    logger.error(`Failed to record queue wait time for ${apiKeyId}:`, error)
+  }
+}
+
+/**
+ * 记录全局排队等待时间
+ * @param {number} waitTimeMs - 等待时间（毫秒）
+ * @returns {Promise<void>}
+ */
+redisClient.recordGlobalQueueWaitTime = async function (waitTimeMs) {
+  const key = 'concurrency:queue:wait_times:global'
+  try {
+    // 使用 Lua 脚本确保原子性，同时设置 TTL 防止内存泄漏
+    const script = `
+      redis.call('LPUSH', KEYS[1], ARGV[1])
+      redis.call('LTRIM', KEYS[1], 0, ARGV[2])
+      redis.call('EXPIRE', KEYS[1], ARGV[3])
+      return 1
+    `
+    await this.client.eval(
+      script,
+      1,
+      key,
+      waitTimeMs,
+      WAIT_TIME_SAMPLES_GLOBAL - 1,
+      WAIT_TIME_TTL_SECONDS
+    )
+  } catch (error) {
+    logger.error('Failed to record global queue wait time:', error)
+  }
+}
+
+/**
+ * 获取全局等待时间列表
+ * @returns {Promise<number[]>} 等待时间列表
+ */
+redisClient.getGlobalQueueWaitTimes = async function () {
+  const key = 'concurrency:queue:wait_times:global'
+  try {
+    const samples = await this.client.lrange(key, 0, -1)
+    return samples.map(Number)
+  } catch (error) {
+    logger.error('Failed to get global queue wait times:', error)
+    return []
+  }
+}
+
+/**
+ * 获取指定 API Key 的等待时间列表
+ * @param {string} apiKeyId - API Key ID
+ * @returns {Promise<number[]>} 等待时间列表
+ */
+redisClient.getQueueWaitTimes = async function (apiKeyId) {
+  const key = `concurrency:queue:wait_times:${apiKeyId}`
+  try {
+    const samples = await this.client.lrange(key, 0, -1)
+    return samples.map(Number)
+  } catch (error) {
+    logger.error(`Failed to get queue wait times for ${apiKeyId}:`, error)
+    return []
+  }
+}
+
+/**
+ * 扫描所有排队统计键
+ * @returns {Promise<string[]>} API Key ID 列表
+ */
+redisClient.scanConcurrencyQueueStatsKeys = async function () {
+  const apiKeyIds = []
+  let cursor = '0'
+  let iterations = 0
+  const MAX_ITERATIONS = 1000
+
+  try {
+    do {
+      const [newCursor, keys] = await this.client.scan(
+        cursor,
+        'MATCH',
+        'concurrency:queue:stats:*',
+        'COUNT',
+        100
+      )
+      cursor = newCursor
+      iterations++
+
+      for (const key of keys) {
+        const apiKeyId = key.replace('concurrency:queue:stats:', '')
+        apiKeyIds.push(apiKeyId)
+      }
+
+      if (iterations >= MAX_ITERATIONS) {
+        break
+      }
+    } while (cursor !== '0')
+
+    return apiKeyIds
+  } catch (error) {
+    logger.error('Failed to scan concurrency queue stats keys:', error)
+    return []
+  }
+}
 
 module.exports = redisClient

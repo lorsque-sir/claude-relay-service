@@ -4,6 +4,72 @@ const config = require('../../config/config')
 const redis = require('../models/redis')
 const logger = require('../utils/logger')
 
+const ACCOUNT_TYPE_CONFIG = {
+  claude: { prefix: 'claude:account:' },
+  'claude-console': { prefix: 'claude_console_account:' },
+  openai: { prefix: 'openai:account:' },
+  'openai-responses': { prefix: 'openai_responses_account:' },
+  'azure-openai': { prefix: 'azure_openai:account:' },
+  gemini: { prefix: 'gemini_account:' },
+  'gemini-api': { prefix: 'gemini_api_account:' },
+  droid: { prefix: 'droid:account:' }
+}
+
+const ACCOUNT_TYPE_PRIORITY = [
+  'openai',
+  'openai-responses',
+  'azure-openai',
+  'claude',
+  'claude-console',
+  'gemini',
+  'gemini-api',
+  'droid'
+]
+
+const ACCOUNT_CATEGORY_MAP = {
+  claude: 'claude',
+  'claude-console': 'claude',
+  openai: 'openai',
+  'openai-responses': 'openai',
+  'azure-openai': 'openai',
+  gemini: 'gemini',
+  'gemini-api': 'gemini',
+  droid: 'droid'
+}
+
+function normalizeAccountTypeKey(type) {
+  if (!type) {
+    return null
+  }
+  const lower = String(type).toLowerCase()
+  if (lower === 'claude_console') {
+    return 'claude-console'
+  }
+  if (lower === 'openai_responses' || lower === 'openai-response' || lower === 'openai-responses') {
+    return 'openai-responses'
+  }
+  if (lower === 'azure_openai' || lower === 'azureopenai' || lower === 'azure-openai') {
+    return 'azure-openai'
+  }
+  if (lower === 'gemini_api' || lower === 'gemini-api') {
+    return 'gemini-api'
+  }
+  return lower
+}
+
+function sanitizeAccountIdForType(accountId, accountType) {
+  if (!accountId || typeof accountId !== 'string') {
+    return accountId
+  }
+  if (accountType === 'openai-responses') {
+    return accountId.replace(/^responses:/, '')
+  }
+  if (accountType === 'gemini-api') {
+    return accountId.replace(/^api:/, '')
+  }
+  return accountId
+}
+
 class ApiKeyService {
   constructor() {
     this.prefix = config.security.apiKeyPrefix
@@ -92,6 +158,14 @@ class ApiKeyService {
     // 保存API Key数据并建立哈希映射
     await redis.setApiKey(keyId, keyData, hashedKey)
 
+    // 同步添加到费用排序索引
+    try {
+      const costRankService = require('./costRankService')
+      await costRankService.addKeyToIndexes(keyId)
+    } catch (err) {
+      logger.warn(`Failed to add key ${keyId} to cost rank indexes:`, err.message)
+    }
+
     logger.success(`🔑 Generated new API key: ${name} (${keyId})`)
 
     return {
@@ -146,6 +220,10 @@ class ApiKeyService {
       const keyData = await redis.findApiKeyByHash(hashedKey)
 
       if (!keyData) {
+        // ⚠️ 警告：映射表查找失败，可能是竞态条件或映射表损坏
+        logger.warn(
+          `⚠️ API key not found in hash map: ${hashedKey.substring(0, 16)}... (possible race condition or corrupted hash map)`
+        )
         return { valid: false, error: 'API key not found' }
       }
 
@@ -305,7 +383,8 @@ class ApiKeyService {
 
       // 检查是否激活
       if (keyData.isActive !== 'true') {
-        return { valid: false, error: 'API key is disabled' }
+        const keyName = keyData.name || 'Unknown'
+        return { valid: false, error: `API Key "${keyName}" 已被禁用`, keyName }
       }
 
       // 注意：这里不处理激活逻辑，保持 API Key 的未激活状态
@@ -316,7 +395,8 @@ class ApiKeyService {
         keyData.expiresAt &&
         new Date() > new Date(keyData.expiresAt)
       ) {
-        return { valid: false, error: 'API key has expired' }
+        const keyName = keyData.name || 'Unknown'
+        return { valid: false, error: `API Key "${keyName}" 已过期`, keyName }
       }
 
       // 如果API Key属于某个用户，检查用户是否被禁用
@@ -418,6 +498,7 @@ class ApiKeyService {
     try {
       let apiKeys = await redis.getAllApiKeys()
       const client = redis.getClientSafe()
+      const accountInfoCache = new Map()
 
       // 默认过滤掉已删除的API Keys
       if (!includeDeleted) {
@@ -524,6 +605,48 @@ class ApiKeyService {
         if (Object.prototype.hasOwnProperty.call(key, 'ccrAccountId')) {
           delete key.ccrAccountId
         }
+
+        let lastUsageRecord = null
+        try {
+          const usageRecords = await redis.getUsageRecords(key.id, 1)
+          if (Array.isArray(usageRecords) && usageRecords.length > 0) {
+            lastUsageRecord = usageRecords[0]
+          }
+        } catch (error) {
+          logger.debug(`加载 API Key ${key.id} 的使用记录失败:`, error)
+        }
+
+        if (lastUsageRecord && (lastUsageRecord.accountId || lastUsageRecord.accountType)) {
+          const resolvedAccount = await this._resolveLastUsageAccount(
+            key,
+            lastUsageRecord,
+            accountInfoCache,
+            client
+          )
+
+          if (resolvedAccount) {
+            key.lastUsage = {
+              accountId: resolvedAccount.accountId,
+              rawAccountId: lastUsageRecord.accountId || resolvedAccount.accountId,
+              accountType: resolvedAccount.accountType,
+              accountCategory: resolvedAccount.accountCategory,
+              accountName: resolvedAccount.accountName,
+              recordedAt: lastUsageRecord.timestamp || key.lastUsedAt || null
+            }
+          } else {
+            key.lastUsage = {
+              accountId: null,
+              rawAccountId: lastUsageRecord.accountId || null,
+              accountType: 'deleted',
+              accountCategory: 'deleted',
+              accountName: '已删除',
+              recordedAt: lastUsageRecord.timestamp || key.lastUsedAt || null
+            }
+          }
+        } else {
+          key.lastUsage = null
+        }
+
         delete key.apiKey // 不返回哈希后的key
       }
 
@@ -603,10 +726,11 @@ class ApiKeyService {
 
       updatedData.updatedAt = new Date().toISOString()
 
-      // 更新时不需要重新建立哈希映射，因为API Key本身没有变化
-      await redis.setApiKey(keyId, updatedData)
+      // 传递hashedKey以确保映射表一致性
+      // keyData.apiKey 存储的就是 hashedKey（见generateApiKey第123行）
+      await redis.setApiKey(keyId, updatedData, keyData.apiKey)
 
-      logger.success(`📝 Updated API key: ${keyId}`)
+      logger.success(`📝 Updated API key: ${keyId}, hashMap updated`)
 
       return { success: true }
     } catch (error) {
@@ -638,6 +762,14 @@ class ApiKeyService {
       // 从哈希映射中移除（这样就不能再使用这个key进行API调用）
       if (keyData.apiKey) {
         await redis.deleteApiKeyHash(keyData.apiKey)
+      }
+
+      // 从费用排序索引中移除
+      try {
+        const costRankService = require('./costRankService')
+        await costRankService.removeKeyFromIndexes(keyId)
+      } catch (err) {
+        logger.warn(`Failed to remove key ${keyId} from cost rank indexes:`, err.message)
       }
 
       logger.success(`🗑️ Soft deleted API key: ${keyId} by ${deletedBy} (${deletedByType})`)
@@ -689,6 +821,14 @@ class ApiKeyService {
           name: keyData.name,
           isActive: 'true'
         })
+      }
+
+      // 重新添加到费用排序索引
+      try {
+        const costRankService = require('./costRankService')
+        await costRankService.addKeyToIndexes(keyId)
+      } catch (err) {
+        logger.warn(`Failed to add restored key ${keyId} to cost rank indexes:`, err.message)
       }
 
       logger.success(`✅ Restored API key: ${keyId} by ${restoredBy} (${restoredByType})`)
@@ -1125,8 +1265,177 @@ class ApiKeyService {
       logParts.push(`Total: ${totalTokens} tokens`)
 
       logger.database(`📊 Recorded usage: ${keyId} - ${logParts.join(', ')}`)
+
+      // 🔔 发布计费事件到消息队列（异步非阻塞）
+      this._publishBillingEvent({
+        keyId,
+        keyName: keyData?.name,
+        userId: keyData?.userId,
+        model,
+        inputTokens,
+        outputTokens,
+        cacheCreateTokens,
+        cacheReadTokens,
+        ephemeral5mTokens,
+        ephemeral1hTokens,
+        totalTokens,
+        cost: costInfo.totalCost || 0,
+        costBreakdown: {
+          input: costInfo.inputCost || 0,
+          output: costInfo.outputCost || 0,
+          cacheCreate: costInfo.cacheCreateCost || 0,
+          cacheRead: costInfo.cacheReadCost || 0,
+          ephemeral5m: costInfo.ephemeral5mCost || 0,
+          ephemeral1h: costInfo.ephemeral1hCost || 0
+        },
+        accountId,
+        accountType,
+        isLongContext: costInfo.isLongContextRequest || false,
+        requestTimestamp: usageRecord.timestamp
+      }).catch((err) => {
+        // 发布失败不影响主流程，只记录错误
+        logger.warn('⚠️ Failed to publish billing event:', err.message)
+      })
     } catch (error) {
       logger.error('❌ Failed to record usage:', error)
+    }
+  }
+
+  async _fetchAccountInfo(accountId, accountType, cache, client) {
+    if (!client || !accountId || !accountType) {
+      return null
+    }
+
+    const cacheKey = `${accountType}:${accountId}`
+    if (cache.has(cacheKey)) {
+      return cache.get(cacheKey)
+    }
+
+    const accountConfig = ACCOUNT_TYPE_CONFIG[accountType]
+    if (!accountConfig) {
+      cache.set(cacheKey, null)
+      return null
+    }
+
+    const redisKey = `${accountConfig.prefix}${accountId}`
+    let accountData = null
+    try {
+      accountData = await client.hgetall(redisKey)
+    } catch (error) {
+      logger.debug(`加载账号信息失败 ${redisKey}:`, error)
+    }
+
+    if (accountData && Object.keys(accountData).length > 0) {
+      const displayName =
+        accountData.name ||
+        accountData.displayName ||
+        accountData.email ||
+        accountData.username ||
+        accountData.description ||
+        accountId
+
+      const info = { id: accountId, name: displayName }
+      cache.set(cacheKey, info)
+      return info
+    }
+
+    cache.set(cacheKey, null)
+    return null
+  }
+
+  async _resolveAccountByUsageRecord(usageRecord, cache, client) {
+    if (!usageRecord || !client) {
+      return null
+    }
+
+    const rawAccountId = usageRecord.accountId || null
+    const rawAccountType = normalizeAccountTypeKey(usageRecord.accountType)
+    const modelName = usageRecord.model || usageRecord.actualModel || usageRecord.service || null
+
+    if (!rawAccountId && !rawAccountType) {
+      return null
+    }
+
+    const candidateIds = new Set()
+    if (rawAccountId) {
+      candidateIds.add(rawAccountId)
+      if (typeof rawAccountId === 'string' && rawAccountId.startsWith('responses:')) {
+        candidateIds.add(rawAccountId.replace(/^responses:/, ''))
+      }
+      if (typeof rawAccountId === 'string' && rawAccountId.startsWith('api:')) {
+        candidateIds.add(rawAccountId.replace(/^api:/, ''))
+      }
+    }
+
+    if (candidateIds.size === 0) {
+      return null
+    }
+
+    const typeCandidates = []
+    const pushType = (type) => {
+      const normalized = normalizeAccountTypeKey(type)
+      if (normalized && ACCOUNT_TYPE_CONFIG[normalized] && !typeCandidates.includes(normalized)) {
+        typeCandidates.push(normalized)
+      }
+    }
+
+    pushType(rawAccountType)
+
+    if (modelName) {
+      const lowerModel = modelName.toLowerCase()
+      if (lowerModel.includes('gpt') || lowerModel.includes('openai')) {
+        pushType('openai')
+        pushType('openai-responses')
+        pushType('azure-openai')
+      } else if (lowerModel.includes('gemini')) {
+        pushType('gemini')
+        pushType('gemini-api')
+      } else if (lowerModel.includes('claude') || lowerModel.includes('anthropic')) {
+        pushType('claude')
+        pushType('claude-console')
+      } else if (lowerModel.includes('droid')) {
+        pushType('droid')
+      }
+    }
+
+    ACCOUNT_TYPE_PRIORITY.forEach(pushType)
+
+    for (const type of typeCandidates) {
+      const accountConfig = ACCOUNT_TYPE_CONFIG[type]
+      if (!accountConfig) {
+        continue
+      }
+
+      for (const candidateId of candidateIds) {
+        const normalizedId = sanitizeAccountIdForType(candidateId, type)
+        const accountInfo = await this._fetchAccountInfo(normalizedId, type, cache, client)
+        if (accountInfo) {
+          return {
+            accountId: normalizedId,
+            accountName: accountInfo.name,
+            accountType: type,
+            accountCategory: ACCOUNT_CATEGORY_MAP[type] || 'other',
+            rawAccountId: rawAccountId || normalizedId
+          }
+        }
+      }
+    }
+
+    return null
+  }
+
+  async _resolveLastUsageAccount(apiKey, usageRecord, cache, client) {
+    return await this._resolveAccountByUsageRecord(usageRecord, cache, client)
+  }
+
+  // 🔔 发布计费事件（内部方法）
+  async _publishBillingEvent(eventData) {
+    try {
+      const billingEventPublisher = require('./billingEventPublisher')
+      await billingEventPublisher.publishBillingEvent(eventData)
+    } catch (error) {
+      // 静默失败，不影响主流程
+      logger.debug('Failed to publish billing event:', error.message)
     }
   }
 
@@ -1262,7 +1571,15 @@ class ApiKeyService {
         permissions: keyData.permissions,
         dailyCostLimit: parseFloat(keyData.dailyCostLimit || 0),
         totalCostLimit: parseFloat(keyData.totalCostLimit || 0),
-        droidAccountId: keyData.droidAccountId
+        // 所有平台账户绑定字段
+        claudeAccountId: keyData.claudeAccountId,
+        claudeConsoleAccountId: keyData.claudeConsoleAccountId,
+        geminiAccountId: keyData.geminiAccountId,
+        openaiAccountId: keyData.openaiAccountId,
+        bedrockAccountId: keyData.bedrockAccountId,
+        droidAccountId: keyData.droidAccountId,
+        azureOpenaiAccountId: keyData.azureOpenaiAccountId,
+        ccrAccountId: keyData.ccrAccountId
       }
     } catch (error) {
       logger.error('❌ Failed to get API key by ID:', error)
@@ -1405,6 +1722,7 @@ class ApiKeyService {
         claude: 'claudeAccountId',
         'claude-console': 'claudeConsoleAccountId',
         gemini: 'geminiAccountId',
+        'gemini-api': 'geminiAccountId', // 特殊处理，带 api: 前缀
         openai: 'openaiAccountId',
         'openai-responses': 'openaiAccountId', // 特殊处理，带 responses: 前缀
         azure_openai: 'azureOpenaiAccountId',
@@ -1427,6 +1745,9 @@ class ApiKeyService {
       if (accountType === 'openai-responses') {
         // OpenAI-Responses 特殊处理：查找 openaiAccountId 字段中带 responses: 前缀的
         boundKeys = allKeys.filter((key) => key.openaiAccountId === `responses:${accountId}`)
+      } else if (accountType === 'gemini-api') {
+        // Gemini-API 特殊处理：查找 geminiAccountId 字段中带 api: 前缀的
+        boundKeys = allKeys.filter((key) => key.geminiAccountId === `api:${accountId}`)
       } else {
         // 其他账号类型正常匹配
         boundKeys = allKeys.filter((key) => key[field] === accountId)
@@ -1437,6 +1758,8 @@ class ApiKeyService {
         const updates = {}
         if (accountType === 'openai-responses') {
           updates.openaiAccountId = null
+        } else if (accountType === 'gemini-api') {
+          updates.geminiAccountId = null
         } else if (accountType === 'claude-console') {
           updates.claudeConsoleAccountId = null
         } else {

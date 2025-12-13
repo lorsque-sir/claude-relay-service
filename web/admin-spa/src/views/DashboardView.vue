@@ -726,7 +726,8 @@ let accountUsageTrendChartInstance = null
 const accountGroupOptions = [
   { value: 'claude', label: 'Claude' },
   { value: 'openai', label: 'OpenAI' },
-  { value: 'gemini', label: 'Gemini' }
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'droid', label: 'Droid' }
 ]
 
 const accountTrendUpdating = ref(false)
@@ -1035,6 +1036,7 @@ function createUsageTrendChart() {
           type: 'linear',
           display: true,
           position: 'left',
+          min: 0,
           title: {
             display: true,
             text: 'Token数量',
@@ -1054,6 +1056,7 @@ function createUsageTrendChart() {
           type: 'linear',
           display: true,
           position: 'right',
+          min: 0,
           title: {
             display: true,
             text: '请求数',
@@ -1072,7 +1075,8 @@ function createUsageTrendChart() {
         y2: {
           type: 'linear',
           display: false, // 隐藏费用轴，在tooltip中显示
-          position: 'right'
+          position: 'right',
+          min: 0
         }
       }
     }
@@ -1252,6 +1256,7 @@ function createApiKeysUsageTrendChart() {
         },
         y: {
           beginAtZero: true,
+          min: 0,
           title: {
             display: true,
             text: apiKeysTrendMetric.value === 'tokens' ? 'Token 数量' : '请求次数',
@@ -1427,6 +1432,7 @@ function createAccountUsageTrendChart() {
         },
         y: {
           beginAtZero: true,
+          min: 0,
           title: {
             display: true,
             text: '消耗金额 (USD)',

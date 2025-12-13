@@ -13,8 +13,14 @@ class DroidScheduler {
       return 'anthropic'
     }
     const normalized = String(endpointType).toLowerCase()
-    if (normalized === 'openai' || normalized === 'common') {
+    if (normalized === 'openai') {
       return 'openai'
+    }
+    if (normalized === 'comm') {
+      return 'comm'
+    }
+    if (normalized === 'anthropic') {
+      return 'anthropic'
     }
     return 'anthropic'
   }
@@ -54,6 +60,11 @@ class DroidScheduler {
     const normalizedEndpoint = this._normalizeEndpointType(endpointType)
     const accountEndpoint = this._normalizeEndpointType(account?.endpointType)
     if (normalizedEndpoint === accountEndpoint) {
+      return true
+    }
+
+    // comm 端点可以使用任何类型的账户
+    if (normalizedEndpoint === 'comm') {
       return true
     }
 
@@ -171,7 +182,7 @@ class DroidScheduler {
 
     if (filtered.length === 0) {
       throw new Error(
-        `No available Droid accounts for endpoint ${normalizedEndpoint}${apiKeyData?.droidAccountId ? ' (respecting binding)' : ''}`
+        `No available accounts for endpoint ${normalizedEndpoint}${apiKeyData?.droidAccountId ? ' (respecting binding)' : ''}`
       )
     }
 
@@ -196,9 +207,7 @@ class DroidScheduler {
     const selected = sorted[0]
 
     if (!selected) {
-      throw new Error(
-        `No schedulable Droid account available after sorting (${normalizedEndpoint})`
-      )
+      throw new Error(`No schedulable account available after sorting (${normalizedEndpoint})`)
     }
 
     if (stickyKey && !isDedicatedBinding) {

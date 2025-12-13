@@ -16,6 +16,22 @@ const {
 const tokenRefreshService = require('./tokenRefreshService')
 const LRUCache = require('../utils/lruCache')
 const { formatDateWithTimezone, getISOStringWithTimezone } = require('../utils/dateHelper')
+const { isOpus45OrNewer } = require('../utils/modelHelper')
+
+/**
+ * Check if account is Pro (not Max)
+ * Compatible with both API real-time data (hasClaudePro) and local config (accountType)
+ * @param {Object} info - Subscription info object
+ * @returns {boolean}
+ */
+function isProAccount(info) {
+  // API real-time status takes priority
+  if (info.hasClaudePro === true && info.hasClaudeMax !== true) {
+    return true
+  }
+  // Local configured account type
+  return info.accountType === 'claude_pro'
+}
 
 class ClaudeAccountService {
   constructor() {
@@ -73,12 +89,15 @@ class ClaudeAccountService {
       autoStopOnWarning = false, // 5小时使用量接近限制时自动停止调度
       useUnifiedUserAgent = false, // 是否使用统一Claude Code版本的User-Agent
       useUnifiedClientId = false, // 是否使用统一的客户端标识
-      unifiedClientId = '' // 统一的客户端标识
+      unifiedClientId = '', // 统一的客户端标识
+      expiresAt = null, // 账户订阅到期时间
+      extInfo = null // 额外扩展信息
     } = options
 
     const accountId = uuidv4()
 
     let accountData
+    const normalizedExtInfo = this._normalizeExtInfo(extInfo, claudeAiOauth)
 
     if (claudeAiOauth) {
       // 使用Claude标准格式的OAuth数据
@@ -113,7 +132,11 @@ class ClaudeAccountService {
           ? JSON.stringify(subscriptionInfo)
           : claudeAiOauth.subscriptionInfo
             ? JSON.stringify(claudeAiOauth.subscriptionInfo)
-            : ''
+            : '',
+        // 账户订阅到期时间
+        subscriptionExpiresAt: expiresAt || '',
+        // 扩展信息
+        extInfo: normalizedExtInfo ? JSON.stringify(normalizedExtInfo) : ''
       }
     } else {
       // 兼容旧格式
@@ -141,7 +164,11 @@ class ClaudeAccountService {
         autoStopOnWarning: autoStopOnWarning.toString(), // 5小时使用量接近限制时自动停止调度
         useUnifiedUserAgent: useUnifiedUserAgent.toString(), // 是否使用统一Claude Code版本的User-Agent
         // 手动设置的订阅信息
-        subscriptionInfo: subscriptionInfo ? JSON.stringify(subscriptionInfo) : ''
+        subscriptionInfo: subscriptionInfo ? JSON.stringify(subscriptionInfo) : '',
+        // 账户订阅到期时间
+        subscriptionExpiresAt: expiresAt || '',
+        // 扩展信息
+        extInfo: normalizedExtInfo ? JSON.stringify(normalizedExtInfo) : ''
       }
     }
 
@@ -180,11 +207,16 @@ class ClaudeAccountService {
       status: accountData.status,
       createdAt: accountData.createdAt,
       expiresAt: accountData.expiresAt,
+      subscriptionExpiresAt:
+        accountData.subscriptionExpiresAt && accountData.subscriptionExpiresAt !== ''
+          ? accountData.subscriptionExpiresAt
+          : null,
       scopes: claudeAiOauth ? claudeAiOauth.scopes : [],
       autoStopOnWarning,
       useUnifiedUserAgent,
       useUnifiedClientId,
-      unifiedClientId
+      unifiedClientId,
+      extInfo: normalizedExtInfo
     }
   }
 
@@ -239,6 +271,24 @@ class ClaudeAccountService {
       // 创建代理agent
       const agent = this._createProxyAgent(accountData.proxy)
 
+      const axiosConfig = {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+          'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Referer: 'https://claude.ai/',
+          Origin: 'https://claude.ai'
+        },
+        timeout: 30000
+      }
+
+      if (agent) {
+        axiosConfig.httpAgent = agent
+        axiosConfig.httpsAgent = agent
+        axiosConfig.proxy = false
+      }
+
       const response = await axios.post(
         this.claudeApiUrl,
         {
@@ -246,18 +296,7 @@ class ClaudeAccountService {
           refresh_token: refreshToken,
           client_id: this.claudeOauthClientId
         },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json, text/plain, */*',
-            'User-Agent': 'claude-cli/1.0.56 (external, cli)',
-            'Accept-Language': 'en-US,en;q=0.9',
-            Referer: 'https://claude.ai/',
-            Origin: 'https://claude.ai'
-          },
-          httpsAgent: agent,
-          timeout: 30000
-        }
+        axiosConfig
       )
 
       if (response.status === 200) {
@@ -469,6 +508,7 @@ class ClaudeAccountService {
           const scopes = account.scopes && account.scopes.trim() ? account.scopes.split(' ') : []
           const isOAuth = scopes.includes('user:profile') && scopes.includes('user:inference')
           const authType = isOAuth ? 'oauth' : 'setup-token'
+          const parsedExtInfo = this._safeParseJson(account.extInfo)
 
           return {
             id: account.id,
@@ -486,7 +526,11 @@ class ClaudeAccountService {
             createdAt: account.createdAt,
             lastUsedAt: account.lastUsedAt,
             lastRefreshAt: account.lastRefreshAt,
-            expiresAt: account.expiresAt,
+            expiresAt: account.expiresAt || null,
+            subscriptionExpiresAt:
+              account.subscriptionExpiresAt && account.subscriptionExpiresAt !== ''
+                ? account.subscriptionExpiresAt
+                : null,
             // 添加 scopes 字段用于判断认证方式
             // 处理空字符串的情况，避免返回 ['']
             scopes: account.scopes && account.scopes.trim() ? account.scopes.split(' ') : [],
@@ -528,7 +572,9 @@ class ClaudeAccountService {
             useUnifiedClientId: account.useUnifiedClientId === 'true', // 默认为false
             unifiedClientId: account.unifiedClientId || '', // 统一的客户端标识
             // 添加停止原因
-            stoppedReason: account.stoppedReason || null
+            stoppedReason: account.stoppedReason || null,
+            // 扩展信息
+            extInfo: parsedExtInfo
           }
         })
       )
@@ -618,10 +664,13 @@ class ClaudeAccountService {
         'autoStopOnWarning',
         'useUnifiedUserAgent',
         'useUnifiedClientId',
-        'unifiedClientId'
+        'unifiedClientId',
+        'subscriptionExpiresAt',
+        'extInfo'
       ]
       const updatedData = { ...accountData }
       let shouldClearAutoStopFields = false
+      let extInfoProvided = false
 
       // 检查是否新增了 refresh token
       const oldRefreshToken = this._decryptSensitiveData(accountData.refreshToken)
@@ -637,6 +686,13 @@ class ClaudeAccountService {
           } else if (field === 'subscriptionInfo') {
             // 处理订阅信息更新
             updatedData[field] = typeof value === 'string' ? value : JSON.stringify(value)
+          } else if (field === 'subscriptionExpiresAt') {
+            // 处理订阅到期时间，允许 null 值（永不过期）
+            updatedData[field] = value ? value.toString() : ''
+          } else if (field === 'extInfo') {
+            const normalized = this._normalizeExtInfo(value, updates.claudeAiOauth)
+            updatedData.extInfo = normalized ? JSON.stringify(normalized) : ''
+            extInfoProvided = true
           } else if (field === 'claudeAiOauth') {
             // 更新 Claude AI OAuth 数据
             if (value) {
@@ -648,9 +704,16 @@ class ClaudeAccountService {
               updatedData.status = 'active'
               updatedData.errorMessage = ''
               updatedData.lastRefreshAt = new Date().toISOString()
+
+              if (!extInfoProvided) {
+                const normalized = this._normalizeExtInfo(value.extInfo, value)
+                if (normalized) {
+                  updatedData.extInfo = JSON.stringify(normalized)
+                }
+              }
             }
           } else {
-            updatedData[field] = value.toString()
+            updatedData[field] = value !== null && value !== undefined ? value.toString() : ''
           }
         }
       }
@@ -769,6 +832,29 @@ class ClaudeAccountService {
     }
   }
 
+  /**
+   * 检查账户订阅是否过期
+   * @param {Object} account - 账户对象
+   * @returns {boolean} - true: 已过期, false: 未过期
+   */
+  isSubscriptionExpired(account) {
+    if (!account.subscriptionExpiresAt) {
+      return false // 未设置过期时间，视为永不过期
+    }
+
+    const expiryDate = new Date(account.subscriptionExpiresAt)
+    const now = new Date()
+
+    if (expiryDate <= now) {
+      logger.debug(
+        `⏰ Account ${account.name} (${account.id}) expired at ${account.subscriptionExpiresAt}`
+      )
+      return true
+    }
+
+    return false
+  }
+
   // 🎯 智能选择可用账户（支持sticky会话和模型过滤）
   async selectAvailableAccount(sessionHash = null, modelName = null) {
     try {
@@ -778,34 +864,43 @@ class ClaudeAccountService {
         (account) =>
           account.isActive === 'true' &&
           account.status !== 'error' &&
-          account.schedulable !== 'false'
+          account.schedulable !== 'false' &&
+          !this.isSubscriptionExpired(account)
       )
 
-      // 如果请求的是 Opus 模型，过滤掉 Pro 和 Free 账号
+      // Filter Opus models based on account type and model version
       if (modelName && modelName.toLowerCase().includes('opus')) {
+        const isNewOpus = isOpus45OrNewer(modelName)
+
         activeAccounts = activeAccounts.filter((account) => {
-          // 检查账号的订阅信息
           if (account.subscriptionInfo) {
             try {
               const info = JSON.parse(account.subscriptionInfo)
-              // Pro 和 Free 账号不支持 Opus
-              if (info.hasClaudePro === true && info.hasClaudeMax !== true) {
-                return false // Claude Pro 不支持 Opus
+
+              // Free account: does not support any Opus model
+              if (info.accountType === 'free') {
+                return false
               }
-              if (info.accountType === 'claude_pro' || info.accountType === 'claude_free') {
-                return false // 明确标记为 Pro 或 Free 的账号不支持
+
+              // Pro account: only supports Opus 4.5+
+              if (isProAccount(info)) {
+                return isNewOpus
               }
+
+              // Max account: supports all Opus versions
+              return true
             } catch (e) {
-              // 解析失败，假设为旧数据，默认支持（兼容旧数据为 Max）
+              // Parse failed, assume legacy data (Max), default support
               return true
             }
           }
-          // 没有订阅信息的账号，默认当作支持（兼容旧数据）
+          // Account without subscription info, default to supported (legacy data compatibility)
           return true
         })
 
         if (activeAccounts.length === 0) {
-          throw new Error('No Claude accounts available that support Opus model')
+          const modelDesc = isNewOpus ? 'Opus 4.5+' : 'legacy Opus (requires Max subscription)'
+          throw new Error(`No Claude accounts available that support ${modelDesc} model`)
         }
       }
 
@@ -873,7 +968,8 @@ class ClaudeAccountService {
           boundAccount &&
           boundAccount.isActive === 'true' &&
           boundAccount.status !== 'error' &&
-          boundAccount.schedulable !== 'false'
+          boundAccount.schedulable !== 'false' &&
+          !this.isSubscriptionExpired(boundAccount)
         ) {
           logger.info(
             `🎯 Using bound dedicated account: ${boundAccount.name} (${apiKeyData.claudeAccountId}) for API key ${apiKeyData.name}`
@@ -894,34 +990,43 @@ class ClaudeAccountService {
           account.isActive === 'true' &&
           account.status !== 'error' &&
           account.schedulable !== 'false' &&
-          (account.accountType === 'shared' || !account.accountType) // 兼容旧数据
+          (account.accountType === 'shared' || !account.accountType) && // 兼容旧数据
+          !this.isSubscriptionExpired(account)
       )
 
-      // 如果请求的是 Opus 模型，过滤掉 Pro 和 Free 账号
+      // Filter Opus models based on account type and model version
       if (modelName && modelName.toLowerCase().includes('opus')) {
+        const isNewOpus = isOpus45OrNewer(modelName)
+
         sharedAccounts = sharedAccounts.filter((account) => {
-          // 检查账号的订阅信息
           if (account.subscriptionInfo) {
             try {
               const info = JSON.parse(account.subscriptionInfo)
-              // Pro 和 Free 账号不支持 Opus
-              if (info.hasClaudePro === true && info.hasClaudeMax !== true) {
-                return false // Claude Pro 不支持 Opus
+
+              // Free account: does not support any Opus model
+              if (info.accountType === 'free') {
+                return false
               }
-              if (info.accountType === 'claude_pro' || info.accountType === 'claude_free') {
-                return false // 明确标记为 Pro 或 Free 的账号不支持
+
+              // Pro account: only supports Opus 4.5+
+              if (isProAccount(info)) {
+                return isNewOpus
               }
+
+              // Max account: supports all Opus versions
+              return true
             } catch (e) {
-              // 解析失败，假设为旧数据，默认支持（兼容旧数据为 Max）
+              // Parse failed, assume legacy data (Max), default support
               return true
             }
           }
-          // 没有订阅信息的账号，默认当作支持（兼容旧数据）
+          // Account without subscription info, default to supported (legacy data compatibility)
           return true
         })
 
         if (sharedAccounts.length === 0) {
-          throw new Error('No shared Claude accounts available that support Opus model')
+          const modelDesc = isNewOpus ? 'Opus 4.5+' : 'legacy Opus (requires Max subscription)'
+          throw new Error(`No shared Claude accounts available that support ${modelDesc} model`)
         }
       }
 
@@ -1781,25 +1886,32 @@ class ClaudeAccountService {
       logger.debug(`📊 Fetching OAuth usage for account: ${accountData.name} (${accountId})`)
 
       // 请求 OAuth usage 接口
-      const response = await axios.get('https://api.anthropic.com/api/oauth/usage', {
+      const axiosConfig = {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
           Accept: 'application/json',
           'anthropic-beta': 'oauth-2025-04-20',
-          'User-Agent': 'claude-cli/1.0.56 (external, cli)',
+          'User-Agent': 'claude-cli/2.0.53 (external, cli)',
           'Accept-Language': 'en-US,en;q=0.9'
         },
-        httpsAgent: agent,
         timeout: 15000
-      })
+      }
+
+      if (agent) {
+        axiosConfig.httpAgent = agent
+        axiosConfig.httpsAgent = agent
+        axiosConfig.proxy = false
+      }
+
+      const response = await axios.get('https://api.anthropic.com/api/oauth/usage', axiosConfig)
 
       if (response.status === 200 && response.data) {
         logger.debug('✅ Successfully fetched OAuth usage data:', {
           accountId,
           fiveHour: response.data.five_hour?.utilization,
           sevenDay: response.data.seven_day?.utilization,
-          sevenDayOpus: response.data.seven_day_opus?.utilization
+          sevenDayOpus: response.data.seven_day_sonnet?.utilization
         })
 
         return response.data
@@ -1901,12 +2013,12 @@ class ClaudeAccountService {
     }
 
     // 7天Opus窗口
-    if (usageData.seven_day_opus) {
-      if (usageData.seven_day_opus.utilization !== undefined) {
-        updates.claudeSevenDayOpusUtilization = String(usageData.seven_day_opus.utilization)
+    if (usageData.seven_day_sonnet) {
+      if (usageData.seven_day_sonnet.utilization !== undefined) {
+        updates.claudeSevenDayOpusUtilization = String(usageData.seven_day_sonnet.utilization)
       }
-      if (usageData.seven_day_opus.resets_at) {
-        updates.claudeSevenDayOpusResetsAt = usageData.seven_day_opus.resets_at
+      if (usageData.seven_day_sonnet.resets_at) {
+        updates.claudeSevenDayOpusResetsAt = usageData.seven_day_sonnet.resets_at
       }
     }
 
@@ -1960,7 +2072,7 @@ class ClaudeAccountService {
       logger.info(`📊 Fetching profile info for account: ${accountData.name} (${accountId})`)
 
       // 请求 profile 接口
-      const response = await axios.get('https://api.anthropic.com/api/oauth/profile', {
+      const axiosConfig = {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
@@ -1968,9 +2080,16 @@ class ClaudeAccountService {
           'User-Agent': 'claude-cli/1.0.56 (external, cli)',
           'Accept-Language': 'en-US,en;q=0.9'
         },
-        httpsAgent: agent,
         timeout: 15000
-      })
+      }
+
+      if (agent) {
+        axiosConfig.httpAgent = agent
+        axiosConfig.httpsAgent = agent
+        axiosConfig.proxy = false
+      }
+
+      const response = await axios.get('https://api.anthropic.com/api/oauth/profile', axiosConfig)
 
       if (response.status === 200 && response.data) {
         const profileData = response.data
@@ -2973,6 +3092,93 @@ class ClaudeAccountService {
     } catch (error) {
       logger.error('❌ Failed to check and recover 5-hour stopped accounts:', error)
       throw error
+    }
+  }
+
+  /**
+   * 规范化扩展信息，提取组织与账户UUID
+   * @param {object|string|null} extInfoSource - 原始扩展信息
+   * @param {object|null} oauthPayload - OAuth 数据载荷
+   * @returns {object|null} 规范化后的扩展信息
+   */
+  _normalizeExtInfo(extInfoSource, oauthPayload) {
+    let extInfo = null
+
+    if (extInfoSource) {
+      if (typeof extInfoSource === 'string') {
+        extInfo = this._safeParseJson(extInfoSource)
+      } else if (typeof extInfoSource === 'object') {
+        extInfo = { ...extInfoSource }
+      }
+    }
+
+    if (!extInfo && oauthPayload && typeof oauthPayload === 'object') {
+      if (oauthPayload.extInfo) {
+        if (typeof oauthPayload.extInfo === 'string') {
+          extInfo = this._safeParseJson(oauthPayload.extInfo)
+        } else if (typeof oauthPayload.extInfo === 'object') {
+          extInfo = { ...oauthPayload.extInfo }
+        }
+      }
+
+      if (!extInfo) {
+        const organization = oauthPayload.organization || null
+        const account = oauthPayload.account || null
+
+        const normalized = {}
+        const orgUuid =
+          organization?.uuid ||
+          organization?.id ||
+          organization?.organization_uuid ||
+          organization?.organization_id
+        const accountUuid =
+          account?.uuid || account?.id || account?.account_uuid || account?.account_id
+
+        if (orgUuid) {
+          normalized.org_uuid = orgUuid
+        }
+
+        if (accountUuid) {
+          normalized.account_uuid = accountUuid
+        }
+
+        extInfo = Object.keys(normalized).length > 0 ? normalized : null
+      }
+    }
+
+    if (!extInfo || typeof extInfo !== 'object') {
+      return null
+    }
+
+    const result = {}
+
+    if (extInfo.org_uuid && typeof extInfo.org_uuid === 'string') {
+      result.org_uuid = extInfo.org_uuid
+    }
+
+    if (extInfo.account_uuid && typeof extInfo.account_uuid === 'string') {
+      result.account_uuid = extInfo.account_uuid
+    }
+
+    return Object.keys(result).length > 0 ? result : null
+  }
+
+  /**
+   * 安全解析 JSON 字符串
+   * @param {string} value - 需要解析的字符串
+   * @returns {object|null} 解析结果
+   */
+  _safeParseJson(value) {
+    if (!value || typeof value !== 'string') {
+      return null
+    }
+
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch (error) {
+      logger.warn('⚠️ 解析扩展信息失败，已忽略：', error.message)
+      return null
     }
   }
 

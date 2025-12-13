@@ -11,7 +11,8 @@ const logger = require('../utils/logger')
 const { getEffectiveModel, parseVendorPrefixedModel } = require('../utils/modelHelper')
 const sessionHelper = require('../utils/sessionHelper')
 const { updateRateLimitCounters } = require('../utils/rateLimitHelper')
-
+const claudeRelayConfigService = require('../services/claudeRelayConfigService')
+const { sanitizeUpstreamError } = require('../utils/errorSanitizer')
 const router = express.Router()
 
 function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') {
@@ -37,6 +38,73 @@ function queueRateLimitUpdate(rateLimitInfo, usageSummary, model, context = '') 
     })
 }
 
+/**
+ * 判断是否为旧会话（污染的会话）
+ * Claude Code 发送的请求特点：
+ * - messages 数组通常只有 1 个元素
+ * - 历史对话记录嵌套在单个 message 的 content 数组中
+ * - content 数组中包含 <system-reminder> 开头的系统注入内容
+ *
+ * 污染会话的特征：
+ * 1. messages.length > 1
+ * 2. messages.length === 1 但 content 中有多个用户输入
+ * 3. "warmup" 请求：单条简单消息 + 无 tools（真正新会话会带 tools）
+ *
+ * @param {Object} body - 请求体
+ * @returns {boolean} 是否为旧会话
+ */
+function isOldSession(body) {
+  const messages = body?.messages
+  const tools = body?.tools
+
+  if (!messages || messages.length === 0) {
+    return false
+  }
+
+  // 1. 多条消息 = 旧会话
+  if (messages.length > 1) {
+    return true
+  }
+
+  // 2. 单条消息，分析 content
+  const firstMessage = messages[0]
+  const content = firstMessage?.content
+
+  if (!content) {
+    return false
+  }
+
+  // 如果 content 是字符串，只有一条输入，需要检查 tools
+  if (typeof content === 'string') {
+    // 有 tools = 正常新会话，无 tools = 可疑
+    return !tools || tools.length === 0
+  }
+
+  // 如果 content 是数组，统计非 system-reminder 的元素
+  if (Array.isArray(content)) {
+    const userInputs = content.filter((item) => {
+      if (item.type !== 'text') {
+        return false
+      }
+      const text = item.text || ''
+      // 剔除以 <system-reminder> 开头的
+      return !text.trimStart().startsWith('<system-reminder>')
+    })
+
+    // 多个用户输入 = 旧会话
+    if (userInputs.length > 1) {
+      return true
+    }
+
+    // Warmup 检测：单个消息 + 无 tools = 旧会话
+    if (userInputs.length === 1 && (!tools || tools.length === 0)) {
+      return true
+    }
+  }
+
+  return false
+}
+
 // 🔧 共享的消息处理函数
 async function handleMessagesRequest(req, res) {
   try {
@@ -54,6 +122,11 @@ async function handleMessagesRequest(req, res) {
           message: '此 API Key 无权访问 Claude 服务'
         }
       })
+    }
+
+    // 🔄 并发满额重试标志：最多重试一次（使用req对象存储状态）
+    if (req._concurrencyRetryAttempted === undefined) {
+      req._concurrencyRetryAttempted = false
     }
 
     // 严格的输入验证
@@ -98,17 +171,61 @@ async function handleMessagesRequest(req, res) {
     // 检查是否为流式请求
     const isStream = req.body.stream === true
 
+    // 临时修复新版本客户端，删除context_management字段，避免报错
+    // if (req.body.context_management) {
+    //   delete req.body.context_management
+    // }
+
+    // 遍历tools数组，删除input_examples字段
+    // if (req.body.tools && Array.isArray(req.body.tools)) {
+    //   req.body.tools.forEach((tool) => {
+    //     if (tool && typeof tool === 'object' && tool.input_examples) {
+    //       delete tool.input_examples
+    //     }
+    //   })
+    // }
+
     logger.api(
       `🚀 Processing ${isStream ? 'stream' : 'non-stream'} request for key: ${req.apiKey.name}`
     )
 
     if (isStream) {
+      // 🔍 检查客户端连接是否仍然有效（可能在并发排队等待期间断开）
+      if (res.destroyed || res.socket?.destroyed || res.writableEnded) {
+        logger.warn(
+          `⚠️ Client disconnected before stream response could start for key: ${req.apiKey?.name || 'unknown'}`
+        )
+        return undefined
+      }
+
       // 流式响应 - 只使用官方真实usage数据
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
       res.setHeader('Access-Control-Allow-Origin', '*')
       res.setHeader('X-Accel-Buffering', 'no') // 禁用 Nginx 缓冲
+      // ⚠️ 检查 headers 是否已发送（可能在排队心跳时已设置）
+      if (!res.headersSent) {
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache')
+        // ⚠️ 关键修复：尊重 auth.js 提前设置的 Connection: close
+        // 当并发队列功能启用时，auth.js 会设置 Connection: close 来禁用 Keep-Alive
+        // 这里只在没有设置过 Connection 头时才设置 keep-alive
+        const existingConnection = res.getHeader('Connection')
+        if (!existingConnection) {
+          res.setHeader('Connection', 'keep-alive')
+        } else {
+          logger.api(
+            `🔌 [STREAM] Preserving existing Connection header: ${existingConnection} for key: ${req.apiKey?.name || 'unknown'}`
+          )
+        }
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('X-Accel-Buffering', 'no') // 禁用 Nginx 缓冲
+      } else {
+        logger.debug(
+          `📤 [STREAM] Headers already sent, skipping setHeader for key: ${req.apiKey?.name || 'unknown'}`
+        )
+      }
 
       // 禁用 Nagle 算法，确保数据立即发送
       if (res.socket && typeof res.socket.setNoDelay === 'function') {
@@ -122,6 +239,56 @@ async function handleMessagesRequest(req, res) {
       // 生成会话哈希用于sticky会话
       const sessionHash = sessionHelper.generateSessionHash(req.body)
 
+      // 🔒 全局会话绑定验证
+      let forcedAccount = null
+      let needSessionBinding = false
+      let originalSessionIdForBinding = null
+
+      try {
+        const globalBindingEnabled = await claudeRelayConfigService.isGlobalSessionBindingEnabled()
+
+        if (globalBindingEnabled) {
+          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+
+          if (originalSessionId) {
+            const validation = await claudeRelayConfigService.validateNewSession(
+              req.body,
+              originalSessionId
+            )
+
+            if (!validation.valid) {
+              logger.api(
+                `❌ Session binding validation failed: ${validation.code} for session ${originalSessionId}`
+              )
+              return res.status(403).json({
+                error: {
+                  type: 'session_binding_error',
+                  message: validation.error
+                }
+              })
+            }
+
+            // 如果已有绑定，使用绑定的账户
+            if (validation.binding) {
+              forcedAccount = validation.binding
+              logger.api(
+                `🔗 Using bound account for session ${originalSessionId}: ${forcedAccount.accountId}`
+              )
+            }
+
+            // 标记需要在调度成功后建立绑定
+            if (validation.isNewSession) {
+              needSessionBinding = true
+              originalSessionIdForBinding = originalSessionId
+              logger.api(`📝 New session detected, will create binding: ${originalSessionId}`)
+            }
+          }
+        }
+      } catch (error) {
+        logger.error('❌ Error in global session binding check:', error)
+        // 配置服务出错时不阻断请求
+      }
+
       // 使用统一调度选择账号（传递请求的模型）
       const requestedModel = req.body.model
       let accountId
@@ -130,10 +297,21 @@ async function handleMessagesRequest(req, res) {
         const selection = await unifiedClaudeScheduler.selectAccountForApiKey(
           req.apiKey,
           sessionHash,
-          requestedModel
+          requestedModel,
+          forcedAccount
         )
         ;({ accountId, accountType } = selection)
       } catch (error) {
+        // 处理会话绑定账户不可用的错误
+        if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
+          const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
+          return res.status(403).json({
+            error: {
+              type: 'session_binding_error',
+              message: errorMessage
+            }
+          })
+        }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
@@ -149,6 +327,40 @@ async function handleMessagesRequest(req, res) {
           return
         }
         throw error
+      }
+
+      // 🔗 在成功调度后建立会话绑定（仅 claude-official 类型）
+      // claude-official 只接受：1) 新会话 2) 已绑定的会话
+      if (
+        needSessionBinding &&
+        originalSessionIdForBinding &&
+        accountId &&
+        accountType === 'claude-official'
+      ) {
+        // 🚫 检测旧会话（污染的会话）
+        if (isOldSession(req.body)) {
+          const cfg = await claudeRelayConfigService.getConfig()
+          logger.warn(
+            `🚫 Old session rejected: sessionId=${originalSessionIdForBinding}, messages.length=${req.body?.messages?.length}, tools.length=${req.body?.tools?.length || 0}, isOldSession=true`
+          )
+          return res.status(400).json({
+            error: {
+              type: 'session_binding_error',
+              message: cfg.sessionBindingErrorMessage || '你的本地session已污染，请清理后使用。'
+            }
+          })
+        }
+
+        // 创建绑定
+        try {
+          await claudeRelayConfigService.setOriginalSessionBinding(
+            originalSessionIdForBinding,
+            accountId,
+            accountType
+          )
+        } catch (bindingError) {
+          logger.warn(`⚠️ Failed to create session binding:`, bindingError)
+        }
       }
 
       // 根据账号类型选择对应的转发服务并调用
@@ -475,14 +687,112 @@ async function handleMessagesRequest(req, res) {
         }
       }, 1000) // 1秒后检查
     } else {
+      // 🔍 检查客户端连接是否仍然有效（可能在并发排队等待期间断开）
+      if (res.destroyed || res.socket?.destroyed || res.writableEnded) {
+        logger.warn(
+          `⚠️ Client disconnected before non-stream request could start for key: ${req.apiKey?.name || 'unknown'}`
+        )
+        return undefined
+      }
+
       // 非流式响应 - 只使用官方真实usage数据
       logger.info('📄 Starting non-streaming request', {
         apiKeyId: req.apiKey.id,
         apiKeyName: req.apiKey.name
       })
 
+      // 📊 监听 socket 事件以追踪连接状态变化
+      const nonStreamSocket = res.socket
+      let _clientClosedConnection = false
+      let _socketCloseTime = null
+
+      if (nonStreamSocket) {
+        const onSocketEnd = () => {
+          _clientClosedConnection = true
+          _socketCloseTime = Date.now()
+          logger.warn(
+            `⚠️ [NON-STREAM] Socket 'end' event - client sent FIN | key: ${req.apiKey?.name}, ` +
+              `requestId: ${req.requestId}, elapsed: ${Date.now() - startTime}ms`
+          )
+        }
+        const onSocketClose = () => {
+          _clientClosedConnection = true
+          logger.warn(
+            `⚠️ [NON-STREAM] Socket 'close' event | key: ${req.apiKey?.name}, ` +
+              `requestId: ${req.requestId}, elapsed: ${Date.now() - startTime}ms, ` +
+              `hadError: ${nonStreamSocket.destroyed}`
+          )
+        }
+        const onSocketError = (err) => {
+          logger.error(
+            `❌ [NON-STREAM] Socket error | key: ${req.apiKey?.name}, ` +
+              `requestId: ${req.requestId}, error: ${err.message}`
+          )
+        }
+
+        nonStreamSocket.once('end', onSocketEnd)
+        nonStreamSocket.once('close', onSocketClose)
+        nonStreamSocket.once('error', onSocketError)
+
+        // 清理监听器（在响应结束后）
+        res.once('finish', () => {
+          nonStreamSocket.removeListener('end', onSocketEnd)
+          nonStreamSocket.removeListener('close', onSocketClose)
+          nonStreamSocket.removeListener('error', onSocketError)
+        })
+      }
+
       // 生成会话哈希用于sticky会话
       const sessionHash = sessionHelper.generateSessionHash(req.body)
+
+      // 🔒 全局会话绑定验证（非流式）
+      let forcedAccountNonStream = null
+      let needSessionBindingNonStream = false
+      let originalSessionIdForBindingNonStream = null
+
+      try {
+        const globalBindingEnabled = await claudeRelayConfigService.isGlobalSessionBindingEnabled()
+
+        if (globalBindingEnabled) {
+          const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+
+          if (originalSessionId) {
+            const validation = await claudeRelayConfigService.validateNewSession(
+              req.body,
+              originalSessionId
+            )
+
+            if (!validation.valid) {
+              logger.api(
+                `❌ Session binding validation failed (non-stream): ${validation.code} for session ${originalSessionId}`
+              )
+              return res.status(403).json({
+                error: {
+                  type: 'session_binding_error',
+                  message: validation.error
+                }
+              })
+            }
+
+            if (validation.binding) {
+              forcedAccountNonStream = validation.binding
+              logger.api(
+                `🔗 Using bound account for session (non-stream) ${originalSessionId}: ${forcedAccountNonStream.accountId}`
+              )
+            }
+
+            if (validation.isNewSession) {
+              needSessionBindingNonStream = true
+              originalSessionIdForBindingNonStream = originalSessionId
+              logger.api(
+                `📝 New session detected (non-stream), will create binding: ${originalSessionId}`
+              )
+            }
+          }
+        }
+      } catch (error) {
+        logger.error('❌ Error in global session binding check (non-stream):', error)
+      }
 
       // 使用统一调度选择账号（传递请求的模型）
       const requestedModel = req.body.model
@@ -492,10 +802,20 @@ async function handleMessagesRequest(req, res) {
         const selection = await unifiedClaudeScheduler.selectAccountForApiKey(
           req.apiKey,
           sessionHash,
-          requestedModel
+          requestedModel,
+          forcedAccountNonStream
         )
         ;({ accountId, accountType } = selection)
       } catch (error) {
+        if (error.code === 'SESSION_BINDING_ACCOUNT_UNAVAILABLE') {
+          const errorMessage = await claudeRelayConfigService.getSessionBindingErrorMessage()
+          return res.status(403).json({
+            error: {
+              type: 'session_binding_error',
+              message: errorMessage
+            }
+          })
+        }
         if (error.code === 'CLAUDE_DEDICATED_RATE_LIMITED') {
           const limitMessage = claudeRelayService._buildStandardRateLimitMessage(
             error.rateLimitEndAt
@@ -506,6 +826,40 @@ async function handleMessagesRequest(req, res) {
           })
         }
         throw error
+      }
+
+      // 🔗 在成功调度后建立会话绑定（非流式，仅 claude-official 类型）
+      // claude-official 只接受：1) 新会话 2) 已绑定的会话
+      if (
+        needSessionBindingNonStream &&
+        originalSessionIdForBindingNonStream &&
+        accountId &&
+        accountType === 'claude-official'
+      ) {
+        // 🚫 检测旧会话（污染的会话）
+        if (isOldSession(req.body)) {
+          const cfg = await claudeRelayConfigService.getConfig()
+          logger.warn(
+            `🚫 Old session rejected (non-stream): sessionId=${originalSessionIdForBindingNonStream}, messages.length=${req.body?.messages?.length}, tools.length=${req.body?.tools?.length || 0}, isOldSession=true`
+          )
+          return res.status(400).json({
+            error: {
+              type: 'session_binding_error',
+              message: cfg.sessionBindingErrorMessage || '你的本地session已污染，请清理后使用。'
+            }
+          })
+        }
+
+        // 创建绑定
+        try {
+          await claudeRelayConfigService.setOriginalSessionBinding(
+            originalSessionIdForBindingNonStream,
+            accountId,
+            accountType
+          )
+        } catch (bindingError) {
+          logger.warn(`⚠️ Failed to create session binding (non-stream):`, bindingError)
+        }
       }
 
       // 根据账号类型选择对应的转发服务
@@ -592,6 +946,15 @@ async function handleMessagesRequest(req, res) {
         bodyLength: response.body ? response.body.length : 0
       })
 
+      // 🔍 检查客户端连接是否仍然有效
+      // 在长时间请求过程中，客户端可能已经断开连接（超时、用户取消等）
+      if (res.destroyed || res.socket?.destroyed || res.writableEnded) {
+        logger.warn(
+          `⚠️ Client disconnected before non-stream response could be sent for key: ${req.apiKey?.name || 'unknown'}`
+        )
+        return undefined
+      }
+
       res.status(response.statusCode)
 
       // 设置响应头，避免 Content-Length 和 Transfer-Encoding 冲突
@@ -657,10 +1020,12 @@ async function handleMessagesRequest(req, res) {
           logger.warn('⚠️ No usage data found in Claude API JSON response')
         }
 
+        // 使用 Express 内建的 res.json() 发送响应（简单可靠）
         res.json(jsonData)
       } catch (parseError) {
         logger.warn('⚠️ Failed to parse Claude API response as JSON:', parseError.message)
         logger.info('📄 Raw response body:', response.body)
+        // 使用 Express 内建的 res.send() 发送响应（简单可靠）
         res.send(response.body)
       }
 
@@ -676,9 +1041,75 @@ async function handleMessagesRequest(req, res) {
     logger.api(`✅ Request completed in ${duration}ms for key: ${req.apiKey.name}`)
     return undefined
   } catch (error) {
-    logger.error('❌ Claude relay error:', error.message, {
-      code: error.code,
-      stack: error.stack
+    let handledError = error
+
+    // 🔄 并发满额降级处理：捕获CONSOLE_ACCOUNT_CONCURRENCY_FULL错误
+    if (
+      handledError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL' &&
+      !req._concurrencyRetryAttempted
+    ) {
+      req._concurrencyRetryAttempted = true
+      logger.warn(
+        `⚠️ Console account ${handledError.accountId} concurrency full, attempting fallback to other accounts...`
+      )
+
+      // 只有在响应头未发送时才能重试
+      if (!res.headersSent) {
+        try {
+          // 清理粘性会话映射（如果存在）
+          const sessionHash = sessionHelper.generateSessionHash(req.body)
+          await unifiedClaudeScheduler.clearSessionMapping(sessionHash)
+
+          logger.info('🔄 Session mapping cleared, retrying handleMessagesRequest...')
+
+          // 递归重试整个请求处理（会选择新账户）
+          return await handleMessagesRequest(req, res)
+        } catch (retryError) {
+          // 重试失败
+          if (retryError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL') {
+            logger.error('❌ All Console accounts reached concurrency limit after retry')
+            return res.status(503).json({
+              error: 'service_unavailable',
+              message:
+                'All available Claude Console accounts have reached their concurrency limit. Please try again later.'
+            })
+          }
+          // 其他错误继续向下处理
+          handledError = retryError
+        }
+      } else {
+        // 响应头已发送，无法重试
+        logger.error('❌ Cannot retry concurrency full error - response headers already sent')
+        if (!res.destroyed && !res.finished) {
+          res.end()
+        }
+        return undefined
+      }
+    }
+
+    // 🚫 第二次并发满额错误：已经重试过，直接返回503
+    if (
+      handledError.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL' &&
+      req._concurrencyRetryAttempted
+    ) {
+      logger.error('❌ All Console accounts reached concurrency limit (retry already attempted)')
+      if (!res.headersSent) {
+        return res.status(503).json({
+          error: 'service_unavailable',
+          message:
+            'All available Claude Console accounts have reached their concurrency limit. Please try again later.'
+        })
+      } else {
+        if (!res.destroyed && !res.finished) {
+          res.end()
+        }
+        return undefined
+      }
+    }
+
+    logger.error('❌ Claude relay error:', handledError.message, {
+      code: handledError.code,
+      stack: handledError.stack
     })
 
     // 确保在任何情况下都能返回有效的JSON响应
@@ -687,23 +1118,29 @@ async function handleMessagesRequest(req, res) {
       let statusCode = 500
       let errorType = 'Relay service error'
 
-      if (error.message.includes('Connection reset') || error.message.includes('socket hang up')) {
+      if (
+        handledError.message.includes('Connection reset') ||
+        handledError.message.includes('socket hang up')
+      ) {
         statusCode = 502
         errorType = 'Upstream connection error'
-      } else if (error.message.includes('Connection refused')) {
+      } else if (handledError.message.includes('Connection refused')) {
         statusCode = 502
         errorType = 'Upstream service unavailable'
-      } else if (error.message.includes('timeout')) {
+      } else if (handledError.message.includes('timeout')) {
         statusCode = 504
         errorType = 'Upstream timeout'
-      } else if (error.message.includes('resolve') || error.message.includes('ENOTFOUND')) {
+      } else if (
+        handledError.message.includes('resolve') ||
+        handledError.message.includes('ENOTFOUND')
+      ) {
         statusCode = 502
         errorType = 'Upstream hostname resolution failed'
       }
 
       return res.status(statusCode).json({
         error: errorType,
-        message: error.message || 'An unexpected error occurred',
+        message: handledError.message || 'An unexpected error occurred',
         timestamp: new Date().toISOString()
       })
     } else {
@@ -722,40 +1159,24 @@ router.post('/v1/messages', authenticateApiKey, handleMessagesRequest)
 // 🚀 Claude API messages 端点 - /claude/v1/messages (别名)
 router.post('/claude/v1/messages', authenticateApiKey, handleMessagesRequest)
 
-// 📋 模型列表端点 - Claude Code 客户端需要
+// 📋 模型列表端点 - 支持 Claude, OpenAI, Gemini
 router.get('/v1/models', authenticateApiKey, async (req, res) => {
   try {
-    // 返回支持的模型列表
-    const models = [
-      {
-        id: 'claude-3-5-sonnet-20241022',
-        object: 'model',
-        created: 1669599635,
-        owned_by: 'anthropic'
-      },
-      {
-        id: 'claude-3-5-haiku-20241022',
-        object: 'model',
-        created: 1669599635,
-        owned_by: 'anthropic'
-      },
-      {
-        id: 'claude-3-opus-20240229',
-        object: 'model',
-        created: 1669599635,
-        owned_by: 'anthropic'
-      },
-      {
-        id: 'claude-sonnet-4-20250514',
-        object: 'model',
-        created: 1669599635,
-        owned_by: 'anthropic'
-      }
-    ]
+    const modelService = require('../services/modelService')
+
+    // 从 modelService 获取所有支持的模型
+    const models = modelService.getAllModels()
+
+    // 可选：根据 API Key 的模型限制过滤
+    let filteredModels = models
+    if (req.apiKey.enableModelRestriction && req.apiKey.restrictedModels?.length > 0) {
+      // 将 restrictedModels 视为黑名单：过滤掉受限模型
+      filteredModels = models.filter((model) => !req.apiKey.restrictedModels.includes(model.id))
+    }
 
     res.json({
       object: 'list',
-      data: models
+      data: filteredModels
     })
   } catch (error) {
     logger.error('❌ Models list error:', error)
@@ -877,84 +1298,151 @@ router.get('/v1/organizations/:org_id/usage', authenticateApiKey, async (req, re
 
 // 🔢 Token计数端点 - count_tokens beta API
 router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) => {
-  try {
-    // 检查权限
-    if (
-      req.apiKey.permissions &&
-      req.apiKey.permissions !== 'all' &&
-      req.apiKey.permissions !== 'claude'
-    ) {
-      return res.status(403).json({
+  // 检查权限
+  if (
+    req.apiKey.permissions &&
+    req.apiKey.permissions !== 'all' &&
+    req.apiKey.permissions !== 'claude'
+  ) {
+    return res.status(403).json({
+      error: {
+        type: 'permission_error',
+        message: 'This API key does not have permission to access Claude'
+      }
+    })
+  }
+
+  // 🔗 会话绑定验证（与 messages 端点保持一致）
+  const originalSessionId = claudeRelayConfigService.extractOriginalSessionId(req.body)
+  const sessionValidation = await claudeRelayConfigService.validateNewSession(
+    req.body,
+    originalSessionId
+  )
+
+  if (!sessionValidation.valid) {
+    logger.warn(
+      `🚫 Session binding validation failed (count_tokens): ${sessionValidation.code} for session ${originalSessionId}`
+    )
+    return res.status(400).json({
+      error: {
+        type: 'session_binding_error',
+        message: sessionValidation.error
+      }
+    })
+  }
+
+  // 🔗 检测旧会话（污染的会话）- 仅对需要绑定的新会话检查
+  if (sessionValidation.isNewSession && originalSessionId) {
+    if (isOldSession(req.body)) {
+      const cfg = await claudeRelayConfigService.getConfig()
+      logger.warn(
+        `🚫 Old session rejected (count_tokens): sessionId=${originalSessionId}, messages.length=${req.body?.messages?.length}, tools.length=${req.body?.tools?.length || 0}, isOldSession=true`
+      )
+      return res.status(400).json({
         error: {
-          type: 'permission_error',
-          message: 'This API key does not have permission to access Claude'
+          type: 'session_binding_error',
+          message: cfg.sessionBindingErrorMessage || '你的本地session已污染，请清理后使用。'
         }
       })
     }
+  }
 
-    logger.info(`🔢 Processing token count request for key: ${req.apiKey.name}`)
+  logger.info(`🔢 Processing token count request for key: ${req.apiKey.name}`)
 
-    // 生成会话哈希用于sticky会话
-    const sessionHash = sessionHelper.generateSessionHash(req.body)
+  const sessionHash = sessionHelper.generateSessionHash(req.body)
+  const requestedModel = req.body.model
+  const maxAttempts = 2
+  let attempt = 0
 
-    // 选择可用的Claude账户
-    const requestedModel = req.body.model
+  // 引入 claudeConsoleAccountService 用于检查 count_tokens 可用性
+  const claudeConsoleAccountService = require('../services/claudeConsoleAccountService')
+
+  const processRequest = async () => {
     const { accountId, accountType } = await unifiedClaudeScheduler.selectAccountForApiKey(
       req.apiKey,
       sessionHash,
       requestedModel
     )
 
-    let response
-    if (accountType === 'claude-official') {
-      // 使用官方Claude账号转发count_tokens请求
-      response = await claudeRelayService.relayRequest(
-        req.body,
-        req.apiKey,
-        req,
-        res,
-        req.headers,
-        {
-          skipUsageRecord: true, // 跳过usage记录，这只是计数请求
-          customPath: '/v1/messages/count_tokens' // 指定count_tokens路径
-        }
-      )
-    } else if (accountType === 'claude-console') {
-      // 使用Console Claude账号转发count_tokens请求
-      response = await claudeConsoleRelayService.relayRequest(
-        req.body,
-        req.apiKey,
-        req,
-        res,
-        req.headers,
-        accountId,
-        {
-          skipUsageRecord: true, // 跳过usage记录，这只是计数请求
-          customPath: '/v1/messages/count_tokens' // 指定count_tokens路径
-        }
-      )
-    } else if (accountType === 'ccr') {
-      // CCR不支持count_tokens
-      return res.status(501).json({
-        error: {
-          type: 'not_supported',
-          message: 'Token counting is not supported for CCR accounts'
-        }
-      })
-    } else {
-      // Bedrock不支持count_tokens
-      return res.status(501).json({
-        error: {
-          type: 'not_supported',
-          message: 'Token counting is not supported for Bedrock accounts'
+    if (accountType === 'ccr') {
+      throw Object.assign(new Error('Token counting is not supported for CCR accounts'), {
+        httpStatus: 501,
+        errorPayload: {
+          error: {
+            type: 'not_supported',
+            message: 'Token counting is not supported for CCR accounts'
+          }
         }
       })
     }
 
-    // 直接返回响应，不记录token使用量
+    if (accountType === 'bedrock') {
+      throw Object.assign(new Error('Token counting is not supported for Bedrock accounts'), {
+        httpStatus: 501,
+        errorPayload: {
+          error: {
+            type: 'not_supported',
+            message: 'Token counting is not supported for Bedrock accounts'
+          }
+        }
+      })
+    }
+
+    // 🔍 claude-console 账户特殊处理：检查 count_tokens 端点是否可用
+    if (accountType === 'claude-console') {
+      const isUnavailable = await claudeConsoleAccountService.isCountTokensUnavailable(accountId)
+      if (isUnavailable) {
+        logger.info(
+          `⏭️ count_tokens unavailable for Claude Console account ${accountId}, returning fallback response`
+        )
+        return { fallbackResponse: true }
+      }
+    }
+
+    const relayOptions = {
+      skipUsageRecord: true,
+      customPath: '/v1/messages/count_tokens'
+    }
+
+    const response =
+      accountType === 'claude-official'
+        ? await claudeRelayService.relayRequest(
+            req.body,
+            req.apiKey,
+            req,
+            res,
+            req.headers,
+            relayOptions
+          )
+        : await claudeConsoleRelayService.relayRequest(
+            req.body,
+            req.apiKey,
+            req,
+            res,
+            req.headers,
+            accountId,
+            relayOptions
+          )
+
+    // 🔍 claude-console 账户：检测上游 404 响应并标记
+    if (accountType === 'claude-console' && response.statusCode === 404) {
+      logger.warn(
+        `⚠️ count_tokens endpoint returned 404 for Claude Console account ${accountId}, marking as unavailable`
+      )
+      // 标记失败不应影响 fallback 响应
+      try {
+        await claudeConsoleAccountService.markCountTokensUnavailable(accountId)
+      } catch (markError) {
+        logger.error(
+          `❌ Failed to mark count_tokens unavailable for account ${accountId}, but will still return fallback:`,
+          markError
+        )
+      }
+      return { fallbackResponse: true }
+    }
+
     res.status(response.statusCode)
 
-    // 设置响应头
     const skipHeaders = ['content-encoding', 'transfer-encoding', 'content-length']
     Object.keys(response.headers).forEach((key) => {
       if (!skipHeaders.includes(key.toLowerCase())) {
@@ -962,23 +1450,105 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
       }
     })
 
-    // 尝试解析并返回JSON响应
     try {
       const jsonData = JSON.parse(response.body)
-      res.json(jsonData)
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        const sanitizedData = sanitizeUpstreamError(jsonData)
+        res.json(sanitizedData)
+      } else {
+        res.json(jsonData)
+      }
     } catch (parseError) {
       res.send(response.body)
     }
 
     logger.info(`✅ Token count request completed for key: ${req.apiKey.name}`)
-  } catch (error) {
-    logger.error('❌ Token count error:', error)
-    res.status(500).json({
-      error: {
-        type: 'server_error',
-        message: 'Failed to count tokens'
+    return { fallbackResponse: false }
+  }
+
+  while (attempt < maxAttempts) {
+    try {
+      const result = await processRequest()
+
+      // 🔍 处理 fallback 响应（claude-console 账户 count_tokens 不可用）
+      if (result && result.fallbackResponse) {
+        if (!res.headersSent) {
+          return res.status(200).json({ input_tokens: 0 })
+        }
+        return
       }
-    })
+
+      return
+    } catch (error) {
+      if (error.code === 'CONSOLE_ACCOUNT_CONCURRENCY_FULL') {
+        logger.warn(
+          `⚠️ Console account concurrency full during count_tokens (attempt ${attempt + 1}/${maxAttempts})`
+        )
+        if (attempt < maxAttempts - 1) {
+          try {
+            await unifiedClaudeScheduler.clearSessionMapping(sessionHash)
+          } catch (clearError) {
+            logger.error('❌ Failed to clear session mapping for count_tokens retry:', clearError)
+            if (!res.headersSent) {
+              return res.status(500).json({
+                error: {
+                  type: 'server_error',
+                  message: 'Failed to count tokens'
+                }
+              })
+            }
+            if (!res.destroyed && !res.finished) {
+              res.end()
+            }
+            return
+          }
+          attempt += 1
+          continue
+        }
+        if (!res.headersSent) {
+          return res.status(503).json({
+            error: 'service_unavailable',
+            message:
+              'All available Claude Console accounts have reached their concurrency limit. Please try again later.'
+          })
+        }
+        if (!res.destroyed && !res.finished) {
+          res.end()
+        }
+        return
+      }
+
+      if (error.httpStatus) {
+        return res.status(error.httpStatus).json(error.errorPayload)
+      }
+
+      // 客户端断开连接不是错误，使用 INFO 级别
+      if (error.message === 'Client disconnected') {
+        logger.info('🔌 Client disconnected during token count request')
+        if (!res.headersSent) {
+          return res.status(499).end() // 499 Client Closed Request
+        }
+        if (!res.destroyed && !res.finished) {
+          res.end()
+        }
+        return
+      }
+
+      logger.error('❌ Token count error:', error)
+      if (!res.headersSent) {
+        return res.status(500).json({
+          error: {
+            type: 'server_error',
+            message: 'Failed to count tokens'
+          }
+        })
+      }
+
+      if (!res.destroyed && !res.finished) {
+        res.end()
+      }
+      return
+    }
   }
 })
 

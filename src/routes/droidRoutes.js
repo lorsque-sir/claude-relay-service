@@ -18,6 +18,7 @@ function hasDroidPermission(apiKeyData) {
  * 支持的 Factory.ai 端点:
  * - /droid/claude - Anthropic (Claude) Messages API
  * - /droid/openai - OpenAI Responses API
+ * - /droid/comm   - OpenAI Chat Completions API
  */
 
 // Claude (Anthropic) 端点 - /v1/messages
@@ -60,13 +61,19 @@ router.post('/claude/v1/messages', authenticateApiKey, async (req, res) => {
   }
 })
 
-router.post('/claude/v1/messages/count_tokens', authenticateApiKey, async (req, res) => {
+// Comm 端点 - /v1/chat/completions（OpenAI Chat Completions 格式）
+router.post('/comm/v1/chat/completions', authenticateApiKey, async (req, res) => {
   try {
-    const requestBody = { ...req.body }
-    if ('stream' in requestBody) {
-      delete requestBody.stream
-    }
-    const sessionHash = sessionHelper.generateSessionHash(requestBody)
+    const sessionId =
+      req.headers['session_id'] ||
+      req.headers['x-session-id'] ||
+      req.body?.session_id ||
+      req.body?.conversation_id ||
+      null
+
+    const sessionHash = sessionId
+      ? crypto.createHash('sha256').update(String(sessionId)).digest('hex')
+      : null
 
     if (!hasDroidPermission(req.apiKey)) {
       logger.security(
@@ -79,23 +86,21 @@ router.post('/claude/v1/messages/count_tokens', authenticateApiKey, async (req, 
     }
 
     const result = await droidRelayService.relayRequest(
-      requestBody,
+      req.body,
       req.apiKey,
       req,
       res,
       req.headers,
-      {
-        endpointType: 'anthropic',
-        sessionHash,
-        customPath: '/a/v1/messages/count_tokens',
-        skipUsageRecord: true,
-        disableStreaming: true
-      }
+      { endpointType: 'comm', sessionHash }
     )
+
+    if (result.streaming) {
+      return
+    }
 
     res.status(result.statusCode).set(result.headers).send(result.body)
   } catch (error) {
-    logger.error('Droid Claude count_tokens relay error:', error)
+    logger.error('Droid Comm relay error:', error)
     res.status(500).json({
       error: 'internal_server_error',
       message: error.message
